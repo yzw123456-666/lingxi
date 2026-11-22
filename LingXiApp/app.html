@@ -46,13 +46,13 @@ button.danger{color:var(--bad)}
 .mode{font-size:12px;padding:5px 12px;border-radius:99px;background:var(--chipbg);color:var(--dim)}
 .mode.c{background:#e0f2fe;color:#0369a1} .mode.d{background:#dcfce7;color:#15803d}
 body.dark .mode.c{background:#173247;color:#4cc9f0} body.dark .mode.d{background:#1c2a3a;color:#3ecf8e}
-.fi{margin-top:14px;font-size:13px;color:var(--dim)} .fi b{color:var(--tx)}
+.fi{margin-top:14px;font-size:13px;color:var(--dim);word-break:break-all} .fi b{color:var(--tx)}
 .prog{height:8px;background:var(--progtr);border-radius:99px;margin-top:16px;overflow:hidden;display:none}
 .prog>div{height:100%;width:0;background:linear-gradient(90deg,#7c83ff,#4cc9f0);border-radius:99px;transition:width .2s}
 .status{margin-top:10px;font-size:13px;color:var(--dim);display:flex;align-items:center;gap:8px}
 .dot{width:8px;height:8px;border-radius:99px;background:var(--ok)} .dot.busy{background:var(--warn);animation:pu 1s infinite}
 @keyframes pu{50%{opacity:.4}}
-.rmsg{margin-top:12px;font-size:13px;padding:10px 14px;border-radius:10px;display:none}
+.rmsg{margin-top:12px;font-size:13px;padding:10px 14px;border-radius:10px;display:none;word-break:break-all}
 .rmsg.ok{display:block;background:var(--okbg);color:var(--ok)} .rmsg.bad{display:block;background:var(--badbg);color:var(--bad)}
 pre.pv{margin-top:14px;background:var(--pvbg);border:1px solid var(--pvbr);border-radius:12px;padding:14px;
  font:12px/1.5 Consolas,monospace;max-height:340px;overflow:auto;white-space:pre-wrap;word-break:break-all;color:var(--pvtx)}
@@ -70,15 +70,14 @@ label.sw input{accent-color:var(--ac);width:16px;height:16px}
   <div class="d1">把文件拖到这里</div>
   <div class="d2">或</div>
   <button id="pick">选择文件</button>
-  <div class="hint">普通文件 → 压缩为 .lx &nbsp;·&nbsp; .lx 文件 → 解压还原（自动识别）&nbsp;·&nbsp; 最大 1GB</div>
+  <div class="hint">普通文件 → 压缩为 .lx &nbsp;·&nbsp; .lx 文件 → 解压还原（自动识别）&nbsp;·&nbsp; 结果保存在原文件旁</div>
  </div>
  <input type="file" id="file" hidden>
- <div class="fi" id="fi" hidden>已选: <b id="fn"></b> <span id="fs"></span></div>
+ <div class="fi" id="fi" hidden>已选: <b id="fn"></b> <span id="fs"></span><br><span id="fp" style="font-size:12px"></span></div>
  <div class="btns">
   <span id="mode" class="mode">未选择文件</span>
   <button id="go" class="primary" disabled>开始</button>
   <button id="pv" disabled>预览内容</button>
-  <button id="open" hidden>重新保存结果</button>
  </div>
  <div class="prog" id="pg"><div id="bar"></div></div>
  <div class="status"><span class="dot" id="dot"></span><span id="st">正在连接引擎…</span></div>
@@ -98,9 +97,10 @@ label.sw input{accent-color:var(--ac);width:16px;height:16px}
 <script>
 const $ = id => document.getElementById(id);
 const fmt = n => n > 1048576 ? (n/1048576).toFixed(2)+' MB' : n > 1024 ? (n/1024).toFixed(1)+' KB' : n+' B';
-let file = null, lastOut = null, lastName = '';
 const isLx = n => n.toLowerCase().endsWith('.lx');
+const HOST = window.chrome && window.chrome.webview;   // WebView2 宿主: 路径直达引擎
 
+/* ---------- 主题 ---------- */
 const tbtn = $('theme');
 function applyTheme(t) {
   document.body.classList.toggle('dark', t === 'dark');
@@ -115,92 +115,183 @@ tbtn.onclick = () => {
   applyTheme(theme);
 };
 
-fetch('/api/status').then(r => r.json()).then(s => {
-  $('ver').textContent = s.version;
-  $('auto').checked = !!s.autostart;
-});
-$('pick').onclick = e => { e.stopPropagation(); $('file').click(); };
-$('file').onchange = e => setFile(e.target.files[0]);
-const dz = $('drop');
-dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('on'); });
-dz.addEventListener('dragleave', () => dz.classList.remove('on'));
-dz.addEventListener('drop', e => { e.preventDefault(); dz.classList.remove('on');
-  if (e.dataTransfer.files.length) setFile(e.dataTransfer.files[0]); });
-dz.onclick = ev => { if (ev.target.tagName !== 'BUTTON') $('file').click(); };
+/* ---------- 选择状态: 路径模式(系统对话框) / 内存模式(拖拽) ---------- */
+let sel = null;          // {kind:'path'|'mem', name, size, path?, file?}
+let lastSelKey = '';
 
-function setFile(f) {
-  file = f; lastOut = null;
-  $('pv').hidden = true; $('open').hidden = true; showMsg('');
-  $('fi').hidden = false; $('fn').textContent = f.name; $('fs').textContent = ' (' + fmt(f.size) + ')';
-  const lx = isLx(f.name);
+function updateSelUI() {
+  if (!sel) { $('mode').textContent = '未选择文件'; $('go').disabled = true; $('pv').disabled = true; return; }
+  $('fi').hidden = false;
+  $('fn').textContent = sel.name;
+  $('fs').textContent = ' (' + fmt(sel.size) + ')';
+  $('fp').textContent = sel.kind === 'path' ? ('路径: ' + sel.path) : '（拖拽模式：整文件读入内存，最大建议 300MB）';
+  const lx = isLx(sel.name);
   $('mode').textContent = lx ? '模式: 解压还原' : '模式: 压缩';
   $('mode').className = 'mode ' + (lx ? 'd' : 'c');
   $('go').disabled = false;
   $('go').textContent = lx ? '开始解压' : '开始压缩';
   $('pv').disabled = !lx;
+  $('pv').hidden = true;
+  showMsg('');
+}
+function setSel(selObj) {
+  sel = selObj;
+  updateSelUI();
 }
 function showMsg(t, ok) {
   const m = $('rmsg'); if (!t) { m.className = 'rmsg'; return; }
   m.textContent = t; m.className = 'rmsg ' + (ok ? 'ok' : 'bad');
 }
 function setBusy(b, pct) {
-  $('go').disabled = b || !file; $('pv').disabled = b || !file || !isLx(file.name);
+  $('go').disabled = b || !sel;
+  $('pv').disabled = b || !sel || !isLx(sel.name);
   $('pg').style.display = b ? 'block' : 'none';
   $('bar').style.width = (pct || 0) + '%';
   $('dot').className = 'dot' + (b ? ' busy' : '');
   $('st').textContent = b ? ('任务进行中 ' + pct + '%') : '空闲';
 }
-async function poll() {
-  try {
-    const s = await (await fetch('/api/status')).json();
-    if (s.busy) setBusy(true, s.progress);
-    const ae = document.activeElement;
-    if (ae !== $('auto')) $('auto').checked = !!s.autostart;
-  } catch (e) {}
+
+/* ---------- 系统文件对话框 (路径模式, 由宿主打开) ---------- */
+$('pick').onclick = () => {
+  if (HOST) HOST.postMessage({ cmd: 'pick' });
+  else $('file').click();
+};
+if (HOST) HOST.addEventListener('message', ev => {
+  const d = ev.data || {};
+  if (d.type === 'picked') {
+    if (d.ok) setSel({ kind: 'path', name: d.name, size: d.size, path: d.path });
+    else if (d.error) showMsg(d.error, false);
+  } else if (d.type === 'done') {
+    setBusy(false, 100);
+    showMsg(d.msg + (d.ok && d.saved ? ('　已保存到: ' + d.saved) : ''), d.ok);
+  } else if (d.type === 'preview') {
+    if (!d.ok) { showMsg(d.msg || '预览失败', false); return; }
+    const p = $('pv'); p.hidden = false;
+    p.textContent = '原始大小: ' + fmt(d.origSize) + ' · ' + d.label + (d.msg ? (' · ' + d.msg) : '') + '\n\n' + d.content;
+  }
+});
+$('file').onchange = e => {
+  const f = e.target.files[0];
+  if (f) setSel({ kind: 'mem', name: f.name, size: f.size, file: f });
+};
+
+/* ---------- 拖拽: 文件夹检测 + 内存模式 ---------- */
+const dz = $('drop');
+dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('on'); });
+dz.addEventListener('dragleave', () => dz.classList.remove('on'));
+dz.addEventListener('drop', async e => {
+  e.preventDefault(); dz.classList.remove('on');
+  if (!e.dataTransfer.files.length) return;
+  const f = e.dataTransfer.files[0];
+  const entry = e.dataTransfer.items && e.dataTransfer.items[0] && e.dataTransfer.items[0].webkitGetAsEntry
+    ? e.dataTransfer.items[0].webkitGetAsEntry() : null;
+  if (entry && entry.isDirectory) { showMsg('拖入的是文件夹，请拖单个文件（或用「选择文件」按钮）', false); return; }
+  setSel({ kind: 'mem', name: f.name, size: f.size, file: f });
+});
+dz.onclick = ev => { if (ev.target.tagName !== 'BUTTON') $('pick').onclick(); };
+
+function friendly(e) {
+  if (e && (e.name === 'NotReadableError' || e.name === 'SecurityError'))
+    return '无法读取该文件: 它可能已被移动/删除、是文件夹、或正被其他程序占用。请改用「选择文件」按钮（系统对话框模式支持任意可访问文件）。';
+  return '失败: ' + (e.message || e);
 }
-setInterval(poll, 800); poll();
+
+/* ---------- 执行 ---------- */
+let waiting = false;
+function waitDone(timeoutMs) {
+  return new Promise(resolve => {
+    const fn = ev => {
+      const d = ev.data || {};
+      if (d.type === 'done' || d.type === 'preview') {
+        HOST.removeEventListener('message', fn); resolve(d);
+      }
+    };
+    HOST.addEventListener('message', fn);
+    setTimeout(() => { HOST.removeEventListener('message', fn); resolve({ type: 'timeout' }); }, timeoutMs);
+  });
+}
 
 $('go').onclick = async () => {
-  if (!file) return;
-  const decompress = isLx(file.name);
+  if (!sel || waiting) return;
+  const decompress = isLx(sel.name);
+  if (sel.kind === 'path') {
+    waiting = true; setBusy(true, 0);
+    const doneP = HOST ? waitDone(1000 * 1024) : null;   // 大文件给足时间
+    HOST.postMessage({ cmd: 'run', op: decompress ? 'decompress' : 'compress', path: sel.path });
+    const d = await doneP;
+    waiting = false; setBusy(false, 100);
+    if (!d || d.type === 'timeout') { showMsg('任务超时或未完成', false); return; }
+    if (d.type === 'done') showMsg(d.msg + (d.ok && d.saved ? ('　已保存到: ' + d.saved) : ''), d.ok);
+    return;
+  }
+  // 内存模式 (拖拽): 读入 → POST
   setBusy(true, 0);
   try {
-    const buf = await file.arrayBuffer();
+    let bytes;
+    try { bytes = new Uint8Array(await sel.file.arrayBuffer()); }
+    catch (e) { showMsg(friendly(e), false); setBusy(false, 0); return; }
     const r = await fetch('/api/' + (decompress ? 'decompress' : 'compress') + '?name='
-      + encodeURIComponent(file.name), { method: 'POST', body: buf });
+      + encodeURIComponent(sel.name), { method: 'POST', body: bytes });
     if (r.status === 409) { showMsg('已有任务进行中，请稍候', false); setBusy(false, 0); return; }
     if (!r.ok) { const j = await r.json().catch(() => ({ msg: '请求失败' })); showMsg(j.msg || '请求失败', false); setBusy(false, 0); return; }
     lastOut = await r.blob();
-    lastName = decompress ? file.name.replace(/\.lx$/i, '') : file.name + '.lx';
+    lastName = decompress ? sel.name.replace(/\.lx$/i, '') : sel.name + '.lx';
     const msg = decodeURIComponent(r.headers.get('X-Lx-Msg-Enc') || '');
     saveResult();
-    showMsg(msg + '　已保存: ' + lastName, true);
-  } catch (e) { showMsg('失败: ' + e, false); }
+    showMsg(msg + '　已下载: ' + lastName + '（拖拽模式结果在浏览器默认下载位置）', true);
+  } catch (e) { showMsg(friendly(e), false); }
   setBusy(false, 0);
 };
-$('pv').onclick = async () => {
-  if (!file) return;
-  setBusy(true, 0);
-  try {
-    const buf = await file.arrayBuffer();
-    const r = await fetch('/api/preview', { method: 'POST', body: buf });
-    const j = await r.json();
-    if (!j.ok) { showMsg(j.msg || '预览失败', false); }
-    else {
-      const p = $('pv'); p.hidden = false;
-      p.textContent = '原始大小: ' + fmt(j.origSize) + ' · ' + j.label + (j.msg ? (' · ' + j.msg) : '') + '\n\n' + j.content;
-    }
-  } catch (e) { showMsg('失败: ' + e, false); }
-  setBusy(false, 0);
-};
+let lastOut = null, lastName = '';
 function saveResult() {
   if (!lastOut) return;
   const url = URL.createObjectURL(lastOut), a = document.createElement('a');
   a.href = url; a.download = lastName; document.body.appendChild(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 3000);
-  $('open').hidden = false;
 }
-$('open').onclick = saveResult;
+
+/* ---------- 预览 ---------- */
+$('pv').onclick = async () => {
+  if (!sel || waiting) return;
+  setBusy(true, 0);
+  try {
+    if (sel.kind === 'path') {
+      const doneP = HOST ? waitDone(1000 * 512) : null;
+      HOST.postMessage({ cmd: 'preview', path: sel.path });
+      const d = await doneP;
+      setBusy(false, 0);
+      if (!d || d.type === 'timeout') { showMsg('预览超时', false); return; }
+      if (d.type !== 'preview') { showMsg(d.msg || '预览失败', false); return; }
+      if (!d.ok) { showMsg(d.msg || '预览失败', false); return; }
+      const p = $('pv'); p.hidden = false;
+      p.textContent = '原始大小: ' + fmt(d.origSize) + ' · ' + d.label + (d.msg ? (' · ' + d.msg) : '') + '\n\n' + d.content;
+      return;
+    }
+    if (!sel.file) return;
+    try {
+      const bytes = new Uint8Array(await sel.file.arrayBuffer());
+      const r = await fetch('/api/preview', { method: 'POST', body: bytes });
+      const j = await r.json();
+      if (!j.ok) { showMsg(j.msg || '预览失败', false); return; }
+      const p = $('pv'); p.hidden = false;
+      p.textContent = '原始大小: ' + fmt(j.origSize) + ' · ' + j.label + (j.msg ? (' · ' + j.msg) : '') + '\n\n' + j.content;
+    } catch (e) { showMsg(friendly(e), false); }
+  } catch (e) { showMsg(friendly(e), false); }
+  finally { setBusy(false, 0); }
+};
+
+/* ---------- 状态/自启/退出 ---------- */
+async function poll() {
+  try {
+    const s = await (await fetch('/api/status')).json();
+    if (s.busy && !waiting) setBusy(true, s.progress);
+    if (!s.busy && !waiting) setBusy(false, 0);
+    const ae = document.activeElement;
+    if (ae !== $('auto')) $('auto').checked = !!s.autostart;
+  } catch (e) { $('st').textContent = '引擎未就绪'; }
+}
+setInterval(poll, 800); poll();
+
 $('auto').onchange = async () => {
   const r = await fetch('/api/autostart', { method: 'POST', body: $('auto').checked ? '1' : '0' });
   const j = await r.json(); $('auto').checked = !!j.enabled; showMsg(j.msg, true);
@@ -209,4 +300,5 @@ $('quit').onclick = async () => {
   if (!confirm('退出灵犀压缩盒？')) return;
   try { await fetch('/api/quit', { method: 'POST' }); } catch (e) {}
 };
+fetch('/api/status').then(r => r.json()).then(s => { $('ver').textContent = s.version; });
 </script></body></html>

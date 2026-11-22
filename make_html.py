@@ -133,8 +133,19 @@ boot().catch(e => { $('st').textContent = '引擎加载失败: ' + e; });
 const dz = $('drop');
 dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('on'); });
 dz.addEventListener('dragleave', () => dz.classList.remove('on'));
-dz.addEventListener('drop', e => { e.preventDefault(); dz.classList.remove('on');
-  if (e.dataTransfer.files.length) setFile(e.dataTransfer.files[0]); });
+dz.addEventListener('drop', e => {
+  e.preventDefault(); dz.classList.remove('on');
+  if (!e.dataTransfer.files.length) return;
+  const entry = e.dataTransfer.items && e.dataTransfer.items[0] && e.dataTransfer.items[0].webkitGetAsEntry
+    ? e.dataTransfer.items[0].webkitGetAsEntry() : null;
+  if (entry && entry.isDirectory) { showMsg('拖入的是文件夹，请拖单个文件', false); return; }
+  setFile(e.dataTransfer.files[0]);
+});
+function friendly(e) {
+  if (e && (e.name === 'NotReadableError' || e.name === 'SecurityError'))
+    return '无法读取该文件: 它可能已被移动/删除、是文件夹、或正被其他程序占用。请重新选择该文件再试。';
+  return '失败: ' + (e.message || e);
+}
 $('file').onchange = e => setFile(e.target.files[0]);
 $('pick').onclick = e => { e.stopPropagation(); $('file').click(); };
 dz.onclick = ev => { if (ev.target.tagName !== 'BUTTON') $('file').click(); };
@@ -208,7 +219,7 @@ async function runJob(decompress) {
     showMsg(msg, true);
     return { blob: lastBlob, bytes: out };
   } catch (e) {
-    showMsg('失败: ' + (e.message || e), false);
+    showMsg(friendly(e), false);
     return null;
   } finally {
     setBusy(false, 0);

@@ -3,6 +3,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.Json;
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.WinForms;
 using Microsoft.Win32;
@@ -145,7 +146,158 @@ public class MainForm : Form
         var env = await CoreWebView2Environment.CreateAsync(null, dataDir);
         await wv.EnsureCoreWebView2Async(env);
         wv.CoreWebView2.Settings.AreDefaultContextMenusEnabled = false;
+        wv.CoreWebView2.WebMessageReceived += OnWebMessage;
         wv.CoreWebView2.Navigate($"http://127.0.0.1:{port}/");
+    }
+
+    void PostJson(object o)
+    {
+        if (wv?.CoreWebView2 == null) return;
+        wv.CoreWebView2.PostWebMessageAsJson(JsonSerializer.Serialize(o));
+    }
+
+    static string UniqueOut(string candidate)
+    {
+        if (!File.Exists(candidate)) return candidate;
+        var dir = Path.GetDirectoryName(candidate)!;
+        var stem = Path.GetFileNameWithoutExtension(candidate);
+        var ext = Path.GetExtension(candidate);
+        for (int i = 1; ; i++)
+        {
+            var c = Path.Combine(dir, $"{stem} ({i}){ext}");
+            if (!File.Exists(c)) return c;
+        }
+    }
+
+    private void OnWebMessage(object? sender, CoreWebView2WebMessageReceivedEventArgs e)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(e.WebMessageAsJson);
+            var root = doc.RootElement;
+            string cmd = root.TryGetProperty("cmd", out var cv) ? cv.GetString() ?? "" : "";
+            switch (cmd)
+            {
+                case "pick":
+                {
+                    using var dlg = new OpenFileDialog
+                    {
+                        Title = "选择要压缩 / 解压的文件",
+                        Filter = "所有文件 (*.*)|*.*|灵犀压缩文件 (*.lx)|*.lx"
+                    };
+                    if (dlg.ShowDialog(this) == DialogResult.OK)
+                    {
+                        var fi = new FileInfo(dlg.FileName);
+                        PostJson(new { type = "picked", ok = true, name = fi.Name, size = fi.Length, path = dlg.FileName });
+                    }
+                    else PostJson(new { type = "picked", ok = false });
+                    break;
+                }
+                case "run":
+                {
+                    string op = root.GetProperty("op").GetString() ?? "";
+                    string path = root.GetProperty("path").GetString() ?? "";
+                    RunPathJob(op, path);
+                    break;
+                }
+                case "preview":
+                {
+                    string path = root.GetProperty("path").GetString() ?? "";
+                    PreviewPathJob(path);
+                    break;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            PostJson(new { type = "done", ok = false, msg = "宿主错误: " + ex.Message });
+        }
+    }
+
+    private async void RunPathJob(string op, string path)
+    {
+        try
+        {
+            if (busy) { PostJson(new { type = "done", ok = false, msg = "已有任务进行中" }); return; }
+            if (!File.Exists(path)) { PostJson(new { type = "done", ok = false, msg = "文件不存在: " + path }); return; }
+            bool decompress = op == "decompress";
+            if (decompress)
+            {
+                var head = new byte[15];
+                using (var fs = File.OpenRead(path))
+                    if (await fs.ReadAsync(head) < 15 || Encoding.ASCII.GetString(head, 0, 3) != "LX1")
+                    {
+                        PostJson(new { type = "done", ok = false, msg = "不是灵犀文件: 缺少 LX1 头" });
+                        return;
+                    }
+            }
+            string candidate = decompress
+                ? Path.Combine(Path.GetDirectoryName(path)!, Path.GetFileNameWithoutExtension(path))
+                : path + ".lx";
+            string tout = UniqueOut(candidate);
+            busy = true; progressPct = 0;
+            var sb = new byte[1024];
+            int rc = 0;
+            try
+            {
+                rc = await Task.Run(() => decompress
+                    ? lx_decompress_file(path, tout, sb, sb.Length)
+                    : lx_compress_file(path, tout, sb, sb.Length));
+            }
+            finally
+            {
+                busy = false; progressPct = 100;
+                lx_shutdown();
+            }
+            var msg = MsgOf(sb);
+            PostJson(new { type = "done", ok = rc == 0, msg = msg, saved = rc == 0 ? tout : "" });
+        }
+        catch (Exception ex)
+        {
+            busy = false;
+            PostJson(new { type = "done", ok = false, msg = "失败: " + ex.Message });
+        }
+    }
+
+    private async void PreviewPathJob(string path)
+    {
+        try
+        {
+            if (busy) { PostJson(new { type = "preview", ok = false, msg = "已有任务进行中" }); return; }
+            if (!File.Exists(path)) { PostJson(new { type = "preview", ok = false, msg = "文件不存在" }); return; }
+            var head = new byte[15];
+            using (var fs = File.OpenRead(path))
+                if (await fs.ReadAsync(head) < 15 || Encoding.ASCII.GetString(head, 0, 3) != "LX1")
+                {
+                    PostJson(new { type = "preview", ok = false, msg = "不是灵犀文件: 缺少 LX1 头" });
+                    return;
+                }
+            string tout = Path.Combine(Path.GetTempPath(), "lxapp_pv_" + Guid.NewGuid().ToString("N") + ".tmp");
+            busy = true; progressPct = 0;
+            var sb = new byte[1024];
+            int rc = 0;
+            try
+            {
+                rc = await Task.Run(() => lx_decompress_file(path, tout, sb, sb.Length));
+            }
+            finally
+            {
+                busy = false; progressPct = 100;
+                lx_shutdown();
+            }
+            var msg = MsgOf(sb);
+            try
+            {
+                if (rc != 0) { PostJson(new { type = "preview", ok = false, msg }); return; }
+                var (origSize, kind, label, content) = BuildPreview(tout, msg);
+                PostJson(new { type = "preview", ok = true, origSize, kind, label, msg, content });
+            }
+            finally { File.Delete(tout); }
+        }
+        catch (Exception ex)
+        {
+            PostJson(new { type = "preview", ok = false, msg = ex.Message });
+        }
     }
 
     // ---------- 开机自启动 (注册表 HKCU Run) ----------
@@ -370,7 +522,8 @@ public class MainForm : Form
 
             if (preview)
             {
-                string json = BuildPreviewJson(tout, msg);
+                var (origSize, kind, label, content) = BuildPreview(tout, msg);
+                var json = JsonSerializer.Serialize(new { ok = true, origSize, kind, label, msg, content });
                 File.Delete(tout);
                 await RespondAsync(s, "application/json; charset=utf-8", "Connection: close\r\n", Encoding.UTF8.GetBytes(json));
                 return;
@@ -392,9 +545,9 @@ public class MainForm : Form
         await RespondErrAsync(s, 404, "no route");
     }
 
-    static string BuildPreviewJson(string tout, string msg)
+    static (long origSize, string kind, string label, string content) BuildPreview(string tout, string msg)
     {
-        byte[] data = File.ReadAllBytes(tout);
+        var data = File.ReadAllBytes(tout);
         int cap = (int)Math.Min(data.Length, 1 << 19);
         bool isText = Utf8Ok(data, cap);
         string esc, label;
@@ -427,7 +580,7 @@ public class MainForm : Form
             esc = JsonEsc(sb.ToString());
             label = "二进制 (十六进制转储, 前 512 字节)";
         }
-        return $"{{\"ok\":1,\"origSize\":{data.Length},\"kind\":\"{(isText ? "text" : "hex")}\",\"label\":\"{label}\",\"msg\":\"{JsonEsc(msg)}\",\"content\":\"{esc}\"}}";
+        return (data.Length, isText ? "text" : "hex", label, esc);
     }
 
     static bool Utf8Ok(byte[] data, int n)
