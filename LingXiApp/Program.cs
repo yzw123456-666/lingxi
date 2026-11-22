@@ -599,6 +599,16 @@ public class MainForm : Form
         await s.WriteAsync(body);
     }
 
+    static void TryDelete(string path)
+    {
+        for (int i = 0; i < 5; i++)
+        {
+            try { if (File.Exists(path)) File.Delete(path); return; }
+            catch (IOException) { Thread.Sleep(300); }
+            catch (UnauthorizedAccessException) { Thread.Sleep(300); }
+        }
+    }
+
     static string JsonEsc(string s) => s
         .Replace("\\", "\\\\").Replace("\"", "\\\"")
         .Replace("\n", "\\n").Replace("\r", "\\r").Replace("\t", "\\t");
@@ -666,7 +676,7 @@ public class MainForm : Form
             }
             finally
             {
-                if (bodyFile.Length > 0 && File.Exists(bodyFile)) File.Delete(bodyFile);
+                if (bodyFile.Length > 0 && File.Exists(bodyFile)) TryDelete(bodyFile);
             }
         }
         catch (Exception ex)
@@ -678,8 +688,19 @@ public class MainForm : Form
 
     async Task RouteAsync(NetworkStream s, string method, string path, string bodyFile, long bodyLen)
     {
+        string nameParam = "";
         var q = path.IndexOf('?');
-        if (q >= 0) path = path[..q];
+        if (q >= 0)
+        {
+            var qs = path[(q + 1)..];
+            path = path[..q];
+            foreach (var kv in qs.Split('&'))
+            {
+                var eq = kv.IndexOf('=');
+                if (eq > 0 && kv[..eq] == "name")
+                    nameParam = Uri.UnescapeDataString(kv[(eq + 1)..]);
+            }
+        }
 
         if (method == "GET" && path == "/")
         {
@@ -749,18 +770,15 @@ public class MainForm : Form
 
             bool decompress = path != "/api/compress";
             bool preview = path == "/api/preview";
-            string tin = Path.Combine(Path.GetTempPath(), "lxapp_in_" + Guid.NewGuid().ToString("N") + ".tmp");
             string tout = Path.Combine(Path.GetTempPath(), "lxapp_out_" + Guid.NewGuid().ToString("N") + ".tmp");
-            File.Copy(bodyFile, tin, true);
 
             if (preview || decompress)
             {
-                // 提前校验 LX1 头
+                // 提前校验 LX1 头 (直接读用户文件, 无中转副本)
                 var head = new byte[15];
-                await using (var fs = File.OpenRead(tin))
+                await using (var fs = File.OpenRead(bodyFile))
                     if (await fs.ReadAsync(head) < 15 || Encoding.ASCII.GetString(head, 0, 3) != "LX1")
                     {
-                        File.Delete(tin);
                         await RespondErrAsync(s, 400, "不是灵犀文件: 缺少 LX1 头");
                         return;
                     }
@@ -774,15 +792,14 @@ public class MainForm : Form
                 await Task.Run(() =>
                 {
                     rc = preview || decompress
-                        ? lx_decompress_file(tin, tout, msgBuf, msgBuf.Length)
-                        : lx_compress_file(tin, tout, msgBuf, msgBuf.Length);
+                        ? lx_decompress_file(bodyFile, tout, msgBuf, msgBuf.Length)
+                        : lx_compress_file(bodyFile, tout, msgBuf, msgBuf.Length);
                 });
             }
             finally
             {
                 busy = false; progressPct = 100;
                 lx_shutdown();              // 任务后释放大表, 空闲回到低占用
-                File.Delete(tin);
             }
             var msg = MsgOf(msgBuf);
 
@@ -790,15 +807,21 @@ public class MainForm : Form
             {
                 var (origSize, kind, label, content) = BuildPreview(tout, msg);
                 var json = JsonSerializer.Serialize(new { ok = true, origSize, kind, label, msg, content });
-                File.Delete(tout);
+                TryDelete(tout);
                 await RespondAsync(s, "application/json; charset=utf-8", "Connection: close\r\n", Encoding.UTF8.GetBytes(json));
                 return;
             }
-            if (rc != 0)
+            if (decompress && IsFolderArchive(tout))
             {
+                string stem = Path.GetFileNameWithoutExtension(
+                    string.IsNullOrEmpty(nameParam) ? "archive" : nameParam);
+                string dest = UniqueDir(Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads", stem));
+                var (files, dirs) = await Task.Run(() => ExtractFolder(tout, dest));
                 File.Delete(tout);
                 await RespondAsync(s, "application/json; charset=utf-8", "Connection: close\r\n",
-                    Encoding.UTF8.GetBytes($"{{\"ok\":0,\"msg\":\"{JsonEsc(msg)}\"}}"));
+                    Encoding.UTF8.GetBytes(JsonSerializer.Serialize(new { ok = true, extracted = true,
+                        msg = $"文件夹已解压: {files} 个文件 / {dirs} 个目录", dest })));
                 return;
             }
             var em = JsonEsc(msg);

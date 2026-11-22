@@ -175,6 +175,68 @@ function setBusy(b, pct) {
 }
 function freshU8() { return new Uint8Array(mem.buffer); }
 
+/* ---------- 文件夹归档 (LXF1) -> 标准 ZIP (无压缩存储法) ---------- */
+function crc32table() {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) { let c = n;
+    for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+    t[n] = c >>> 0; }
+  return t;
+}
+const CRC_T = crc32table();
+function crc32(u8) { let c = 0xFFFFFFFF;
+  for (let i = 0; i < u8.length; i++) c = CRC_T[(c ^ u8[i]) & 0xFF] ^ (c >>> 8);
+  return (c ^ 0xFFFFFFFF) >>> 0; }
+
+function lxfToZip(u8) {
+  if (!(u8[0] === 0x4C && u8[1] === 0x58 && u8[2] === 0x46 && u8[3] === 0x31)) return null;
+  const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+  let off = 4;
+  const count = dv.getUint32(off, true); off += 4;
+  const utf8 = new TextDecoder();
+  const entries = [];
+  for (let i = 0; i < count; i++) {
+    const pl = dv.getUint16(off, true); off += 2;
+    const path = utf8.decode(u8.subarray(off, off + pl)); off += pl;
+    const isDir = u8[off] === 1; off += 1;
+    const size = Number(dv.getBigUint64(off, true)); off += 8;
+    entries.push({ path, isDir, size, dataOff: 0 });
+  }
+  let p = off;
+  for (const e of entries) { if (!e.isDir) { e.dataOff = p; p += e.size; } }
+
+  const enc = new TextEncoder();
+  const chunks = [], central = [];
+  let offset = 0;
+  const w16 = v => { const b = new Uint8Array(2); new DataView(b.buffer).setUint16(0, v, true); chunks.push(b); offset += 2; };
+  const w32 = v => { const b = new Uint8Array(4); new DataView(b.buffer).setUint32(0, v >>> 0, true); chunks.push(b); offset += 4; };
+  const wbytes = b => { chunks.push(b); offset += b.length; };
+
+  for (const e of entries) {
+    const nameB = enc.encode((e.isDir ? e.path.replace(/\/+$/, '') : e.path) + (e.isDir ? '/' : ''));
+    const data = e.isDir ? new Uint8Array(0) : u8.subarray(e.dataOff, e.dataOff + e.size);
+    const crc = crc32(data);
+    central.push({ nameB, crc, size: data.length, off: offset });
+    w32(0x04034b50); w16(20); w16(0x0800); w16(0); w16(0); w16(0x0021);
+    w32(crc); w32(data.length); w32(data.length); w16(nameB.length); w16(0);
+    wbytes(nameB); if (data.length) wbytes(data);
+  }
+  const cdStart = offset;
+  for (const c of central) {
+    w32(0x02014b50); w16(20); w16(20); w16(0x0800); w16(0); w16(0); w16(0x0021);
+    w32(c.crc); w32(c.size); w32(c.size); w16(c.nameB.length); w16(0);
+    w16(0); w16(0); w32(0); w32(c.off); wbytes(c.nameB);
+  }
+  const cdSize = offset - cdStart;
+  w32(0x06054b50); w16(0); w16(0); w16(central.length); w16(central.length);
+  w32(cdSize); w32(cdStart); w16(0);
+  const total = chunks.reduce((a, b) => a + b.length, 0);
+  const out = new Uint8Array(total);
+  let pos = 0;
+  for (const b of chunks) { out.set(b, pos); pos += b.length; }
+  return out;
+}
+
 async function runJob(decompress) {
   const n = file.size;
   setBusy(true, 0);
@@ -208,9 +270,18 @@ async function runJob(decompress) {
     }
     const outLen = E.lx_out_len();
     const out = freshU8().slice(E.lx_out_ptr(), E.lx_out_ptr() + outLen);
+    const pct = outLen * 100 / n;
+    if (decompress && out[0] === 0x4C && out[1] === 0x58 && out[2] === 0x46 && out[3] === 0x31) {
+      const zipBytes = lxfToZip(out);
+      if (!zipBytes) throw new Error('文件夹归档解析失败');
+      lastBlob = new Blob([zipBytes]);
+      lastName = file.name.replace(/\.lx$/i, '') + '.zip';
+      saveResult();
+      showMsg(`文件夹归档已转为 ZIP (${fmt(zipBytes.length)})　已保存: ${lastName}　解压 ZIP 即得原文件夹`, true);
+      return { blob: lastBlob, bytes: zipBytes };
+    }
     lastBlob = new Blob([out]);
     lastName = decompress ? file.name.replace(/\.lx$/i, '') : file.name + '.lx';
-    const pct = outLen * 100 / n;
     const msg = decompress
       ? `解压完成: ${fmt(n)} → ${fmt(outLen)}, CRC 校验通过`
       : `压缩完成: ${fmt(n)} → ${fmt(outLen)} (${pct.toFixed(1)}%, ${(outLen*8/n).toFixed(3)} bpc)　已保存: ${lastName}`;
