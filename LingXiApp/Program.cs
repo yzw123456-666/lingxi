@@ -156,17 +156,173 @@ public class MainForm : Form
         wv.CoreWebView2.PostWebMessageAsJson(JsonSerializer.Serialize(o));
     }
 
+    static string? JsonBodyProp(string bodyFile, string prop)
+    {
+        if (!File.Exists(bodyFile)) return null;
+        try
+        {
+            using var doc = JsonDocument.Parse(File.ReadAllText(bodyFile));
+            var v = doc.RootElement.GetProperty(prop).GetString();
+            return v;
+        }
+        catch { return null; }
+    }
+
     static string UniqueOut(string candidate)
     {
-        if (!File.Exists(candidate)) return candidate;
+        if (!File.Exists(candidate) && !Directory.Exists(candidate)) return candidate;
         var dir = Path.GetDirectoryName(candidate)!;
         var stem = Path.GetFileNameWithoutExtension(candidate);
         var ext = Path.GetExtension(candidate);
         for (int i = 1; ; i++)
         {
             var c = Path.Combine(dir, $"{stem} ({i}){ext}");
-            if (!File.Exists(c)) return c;
+            if (!File.Exists(c) && !Directory.Exists(c)) return c;
         }
+    }
+
+    static string UniqueDir(string candidate)
+    {
+        if (!Directory.Exists(candidate)) return candidate;
+        for (int i = 1; ; i++)
+        {
+            var c = candidate + $" ({i})";
+            if (!Directory.Exists(c)) return c;
+        }
+    }
+
+    // ---------- 文件夹归档 (LXF1 容器: 清单 + 顺序载荷, 交给引擎整体压缩) ----------
+    // 格式: "LXF1" + u32 条目数 + N×[u16 路径长 + UTF-8 路径 + u8 isDir + u64 size] + 顺序文件载荷
+    const string LxfMagic = "LXF1";
+
+    static void CollectEntries(DirectoryInfo dir, string prefix,
+        List<(string rel, bool isDir, long size, string full)> acc)
+    {
+        foreach (var d in dir.EnumerateDirectories())
+        {
+            var rel = prefix + d.Name + "/";
+            acc.Add((rel, true, 0, d.FullName));
+            CollectEntries(d, rel, acc);
+        }
+        foreach (var f in dir.EnumerateFiles())
+            acc.Add((prefix + f.Name, false, f.Length, f.FullName));
+    }
+
+    static void PackFolder(string dir, string outLxf)
+    {
+        var root = new DirectoryInfo(dir);
+        var entries = new List<(string rel, bool isDir, long size, string full)>();
+        CollectEntries(root, "", entries);
+        entries.Sort((a, b) => string.CompareOrdinal(a.rel, b.rel));
+
+        using var outf = new FileStream(outLxf, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20);
+        outf.Write(Encoding.ASCII.GetBytes(LxfMagic));
+        outf.Write(BitConverter.GetBytes((uint)entries.Count));
+        foreach (var e in entries)
+        {
+            var pb = Encoding.UTF8.GetBytes(e.rel);
+            outf.Write(BitConverter.GetBytes((ushort)pb.Length));
+            outf.Write(pb);
+            outf.Write(new byte[] { (byte)(e.isDir ? 1 : 0) });
+            outf.Write(BitConverter.GetBytes((ulong)e.size));
+        }
+        foreach (var e in entries)
+        {
+            if (e.isDir) continue;
+            using var fs = new FileStream(e.full, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20);
+            fs.CopyTo(outf);
+        }
+    }
+
+    static string SafeRel(string p)
+    {
+        var n = p.Replace('\\', '/').TrimEnd('/');
+        if (n.Length == 0) throw new IOException("归档包含空路径");
+        if (n.Contains("..") || n.StartsWith('/') || n.Contains(':'))
+            throw new IOException("归档包含非法路径: " + p);
+        return n;
+    }
+
+    static bool IsFolderArchive(string file)
+    {
+        using var f = File.OpenRead(file);
+        var m = new byte[4];
+        if (f.Read(m, 0, 4) < 4) return false;
+        return Encoding.ASCII.GetString(m) == LxfMagic;
+    }
+
+    static (int files, int dirs) ExtractFolder(string lxf, string destDir)
+    {
+        using var f = new FileStream(lxf, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20);
+        var magic = new byte[4];
+        f.ReadExactly(magic, 0, 4);
+        if (Encoding.ASCII.GetString(magic) != LxfMagic) throw new IOException("不是文件夹归档");
+        var cnt = new byte[4];
+        f.ReadExactly(cnt, 0, 4);
+        uint count = BitConverter.ToUInt32(cnt, 0);
+        var meta = new List<(string rel, bool isDir, ulong size)>();
+        for (uint i = 0; i < count; i++)
+        {
+            var lb = new byte[2]; f.ReadExactly(lb, 0, 2);
+            ushort pl = BitConverter.ToUInt16(lb, 0);
+            var pb = new byte[pl]; f.ReadExactly(pb, 0, pl);
+            var fl = new byte[1]; f.ReadExactly(fl, 0, 1);
+            var zb = new byte[8]; f.ReadExactly(zb, 0, 8);
+            meta.Add((Encoding.UTF8.GetString(pb), fl[0] == 1, BitConverter.ToUInt64(zb, 0)));
+        }
+        Directory.CreateDirectory(destDir);
+        int files = 0, dirs = 0;
+        long doneBytes = 0;
+        long totalBytes = meta.Sum(m => (long)m.size);
+        foreach (var (rel, isDir, size) in meta)
+        {
+            var target = Path.Combine(destDir, SafeRel(rel).Replace('/', Path.DirectorySeparatorChar));
+            if (isDir)
+            {
+                Directory.CreateDirectory(target); dirs++;
+                continue;
+            }
+            Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+            using var fs = new FileStream(target, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20);
+            var buf = new byte[1 << 16];
+            ulong left = size;
+            while (left > 0)
+            {
+                int chunk = (int)Math.Min(left, (ulong)buf.Length);
+                f.ReadExactly(buf, 0, chunk);
+                fs.Write(buf, 0, chunk);
+                left -= (ulong)chunk;
+                doneBytes += chunk;
+                progressPct = (int)(doneBytes * 100 / (totalBytes == 0 ? 1 : totalBytes));
+            }
+            files++;
+        }
+        return (files, dirs);
+    }
+
+    static (uint count, List<(string rel, bool isDir, ulong size)>, long totalBytes) ListManifest(string lxf)
+    {
+        using var f = new FileStream(lxf, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20);
+        var magic = new byte[4];
+        f.ReadExactly(magic, 0, 4);
+        if (Encoding.ASCII.GetString(magic) != LxfMagic) throw new IOException("不是文件夹归档");
+        var cnt = new byte[4];
+        f.ReadExactly(cnt, 0, 4);
+        uint count = BitConverter.ToUInt32(cnt, 0);
+        var meta = new List<(string rel, bool isDir, ulong size)>();
+        long total = 0;
+        for (uint i = 0; i < count; i++)
+        {
+            var lb = new byte[2]; f.ReadExactly(lb, 0, 2);
+            ushort pl = BitConverter.ToUInt16(lb, 0);
+            var pb = new byte[pl]; f.ReadExactly(pb, 0, pl);
+            var fl = new byte[1]; f.ReadExactly(fl, 0, 1);
+            var zb = new byte[8]; f.ReadExactly(zb, 0, 8);
+            var sz = BitConverter.ToUInt64(zb, 0);
+            meta.Add((Encoding.UTF8.GetString(pb), fl[0] == 1, sz));
+            if (fl[0] == 0) total += (long)sz;
+        }
+        return (count, meta, total);
     }
 
     private void OnWebMessage(object? sender, CoreWebView2WebMessageReceivedEventArgs e)
@@ -198,6 +354,31 @@ public class MainForm : Form
                     string op = root.GetProperty("op").GetString() ?? "";
                     string path = root.GetProperty("path").GetString() ?? "";
                     RunPathJob(op, path);
+                    break;
+                }
+                case "pickdir":
+                {
+                    using var dlg = new FolderBrowserDialog
+                    {
+                        Description = "选择要压缩的文件夹",
+                        ShowNewFolderButton = false
+                    };
+                    if (dlg.ShowDialog(this) == DialogResult.OK)
+                    {
+                        long bytes = 0; int files = 0;
+                        foreach (var f in new DirectoryInfo(dlg.SelectedPath).EnumerateFiles("*", SearchOption.AllDirectories))
+                        { bytes += f.Length; files++; }
+                        PostJson(new { type = "picked-dir", ok = true, name = Path.GetFileName(
+                            dlg.SelectedPath.TrimEnd(Path.DirectorySeparatorChar)), path = dlg.SelectedPath,
+                            files, bytes });
+                    }
+                    else PostJson(new { type = "picked-dir", ok = false });
+                    break;
+                }
+                case "rundir":
+                {
+                    string path = root.GetProperty("path").GetString() ?? "";
+                    RunDirJob(path);
                     break;
                 }
                 case "preview":
@@ -234,7 +415,7 @@ public class MainForm : Form
             string candidate = decompress
                 ? Path.Combine(Path.GetDirectoryName(path)!, Path.GetFileNameWithoutExtension(path))
                 : path + ".lx";
-            string tout = UniqueOut(candidate);
+            string tout = Path.Combine(Path.GetTempPath(), "lxapp_out_" + Guid.NewGuid().ToString("N") + ".tmp");
             busy = true; progressPct = 0;
             var sb = new byte[1024];
             int rc = 0;
@@ -250,7 +431,60 @@ public class MainForm : Form
                 lx_shutdown();
             }
             var msg = MsgOf(sb);
-            PostJson(new { type = "done", ok = rc == 0, msg = msg, saved = rc == 0 ? tout : "" });
+            if (rc != 0)
+            {
+                File.Delete(tout);
+                PostJson(new { type = "done", ok = false, msg = msg });
+                return;
+            }
+            if (decompress && IsFolderArchive(tout))
+            {
+                string dest = UniqueDir(candidate);
+                var (files, dirs) = ExtractFolder(tout, dest);
+                File.Delete(tout);
+                PostJson(new { type = "done", ok = true,
+                    msg = $"解压完成: {files} 个文件 / {dirs} 个文件夹　已保存到: {dest}", saved = dest });
+                return;
+            }
+            string final = UniqueOut(candidate);
+            File.Move(tout, final, true);
+            PostJson(new { type = "done", ok = true, msg = msg + "　已保存到: " + final, saved = final });
+        }
+        catch (Exception ex)
+        {
+            busy = false;
+            PostJson(new { type = "done", ok = false, msg = "失败: " + ex.Message });
+        }
+    }
+
+    private async void RunDirJob(string path)
+    {
+        try
+        {
+            if (busy) { PostJson(new { type = "done", ok = false, msg = "已有任务进行中" }); return; }
+            if (!Directory.Exists(path)) { PostJson(new { type = "done", ok = false, msg = "文件夹不存在" }); return; }
+            string name = Path.GetFileName(path.TrimEnd(Path.DirectorySeparatorChar));
+            string outLx = UniqueOut(Path.Combine(Path.GetDirectoryName(path)!, name) + ".lx");
+            string tmpLxf = Path.Combine(Path.GetTempPath(), "lxapp_dir_" + Guid.NewGuid().ToString("N") + ".lxf");
+            busy = true; progressPct = 0;
+            var sb = new byte[1024];
+            int rc = 0;
+            try
+            {
+                rc = await Task.Run(() =>
+                {
+                    PackFolder(path, tmpLxf);
+                    return lx_compress_file(tmpLxf, outLx, sb, sb.Length);
+                });
+            }
+            finally
+            {
+                busy = false; progressPct = 100;
+                lx_shutdown();
+                try { File.Delete(tmpLxf); } catch { }
+            }
+            var msg = MsgOf(sb);
+            PostJson(new { type = "done", ok = rc == 0, msg, saved = rc == 0 ? outLx : "" });
         }
         catch (Exception ex)
         {
@@ -473,6 +707,39 @@ public class MainForm : Form
             await RespondAsync(s, "application/json; charset=utf-8", "Connection: close\r\n",
                 Encoding.UTF8.GetBytes("{\"ok\":1,\"msg\":\"bye\"}"));
             BeginInvoke(() => { reallyExit = true; tray.Visible = false; Close(); Application.Exit(); });
+            return;
+        }
+        if (method == "POST" && path == "/api/packdir")
+        {
+            if (busy) { await RespondErrAsync(s, 409, "已有任务进行中"); return; }
+            var dirPath = JsonBodyProp(bodyFile, "path");
+            if (dirPath == null || !Directory.Exists(dirPath)) { await RespondErrAsync(s, 400, "文件夹不存在"); return; }
+            string tmpLxf = Path.Combine(Path.GetTempPath(), "lxapp_pack_" + Guid.NewGuid().ToString("N") + ".lxf");
+            try
+            {
+                busy = true; progressPct = 0;
+                PackFolder(dirPath, tmpLxf);
+                busy = false;
+                await RespondFileAsync(s, "application/octet-stream", "Connection: close\r\n", tmpLxf);
+            }
+            finally { busy = false; File.Delete(tmpLxf); }
+            return;
+        }
+        if (method == "POST" && path == "/api/extractdir")
+        {
+            if (busy) { await RespondErrAsync(s, 409, "已有任务进行中"); return; }
+            var lxfPath = JsonBodyProp(bodyFile, "path");
+            if (lxfPath == null || !File.Exists(lxfPath)) { await RespondErrAsync(s, 400, "归档文件不存在"); return; }
+            busy = true; progressPct = 0;
+            try
+            {
+                string dest = UniqueDir(lxfPath[..^3] is var stem && stem.Length > 0 ? stem : lxfPath + "_out");
+                var (files, dirs) = await Task.Run(() => ExtractFolder(lxfPath, dest));
+                await RespondAsync(s, "application/json; charset=utf-8", "Connection: close\r\n",
+                    Encoding.UTF8.GetBytes($"{{\"ok\":1,\"files\":{files},\"dirs\":{dirs},\"dest\":\"{JsonEsc(dest)}\"}}"));
+            }
+            catch (Exception ex) { await RespondErrAsync(s, 500, ex.Message); }
+            finally { busy = false; }
             return;
         }
         if (method == "POST" && (path == "/api/compress" || path == "/api/decompress" || path == "/api/preview"))

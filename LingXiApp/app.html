@@ -70,7 +70,8 @@ label.sw input{accent-color:var(--ac);width:16px;height:16px}
   <div class="d1">把文件拖到这里</div>
   <div class="d2">或</div>
   <button id="pick">选择文件</button>
-  <div class="hint">普通文件 → 压缩为 .lx &nbsp;·&nbsp; .lx 文件 → 解压还原（自动识别）&nbsp;·&nbsp; 结果保存在原文件旁</div>
+  <button id="pickdir">选择文件夹</button>
+  <div class="hint">文件/文件夹 → 压缩为一个 .lx &nbsp;·&nbsp; .lx → 解压还原（自动识别）&nbsp;·&nbsp; 无大小限制（受可用内存约束）</div>
  </div>
  <input type="file" id="file" hidden>
  <div class="fi" id="fi" hidden>已选: <b id="fn"></b> <span id="fs"></span><br><span id="fp" style="font-size:12px"></span></div>
@@ -123,14 +124,17 @@ function updateSelUI() {
   if (!sel) { $('mode').textContent = '未选择文件'; $('go').disabled = true; $('pv').disabled = true; return; }
   $('fi').hidden = false;
   $('fn').textContent = sel.name;
-  $('fs').textContent = ' (' + fmt(sel.size) + ')';
-  $('fp').textContent = sel.kind === 'path' ? ('路径: ' + sel.path) : '（拖拽模式：整文件读入内存；超大文件请用「选择文件」模式，磁盘直读无限制）';
+  $('fs').textContent = ' (' + fmt(sel.size) + (sel.kind === 'dir' ? ', ' + sel.files + ' 个文件' : '') + ')';
+  $('fp').textContent = sel.kind === 'dir' ? ('文件夹: ' + sel.path)
+    : sel.kind === 'path' ? ('路径: ' + sel.path)
+    : '（拖拽模式：整文件读入内存；超大文件请用「选择文件」模式，磁盘直读无限制）';
   const lx = isLx(sel.name);
-  $('mode').textContent = lx ? '模式: 解压还原' : '模式: 压缩';
-  $('mode').className = 'mode ' + (lx ? 'd' : 'c');
+  const isDir = sel.kind === 'dir';
+  $('mode').textContent = isDir ? ('模式: 压缩文件夹 (' + sel.files + ' 个文件)') : lx ? '模式: 解压还原' : '模式: 压缩';
+  $('mode').className = 'mode ' + (isDir ? 'c' : lx ? 'd' : 'c');
   $('go').disabled = false;
-  $('go').textContent = lx ? '开始解压' : '开始压缩';
-  $('pv').disabled = !lx;
+  $('go').textContent = isDir ? '开始压缩文件夹' : lx ? '开始解压' : '开始压缩';
+  $('pv').disabled = !lx || isDir;
   $('pv').hidden = true;
   showMsg('');
 }
@@ -156,10 +160,17 @@ $('pick').onclick = () => {
   if (HOST) HOST.postMessage({ cmd: 'pick' });
   else $('file').click();
 };
+$('pickdir').onclick = () => {
+  if (HOST) HOST.postMessage({ cmd: 'pickdir' });
+  else showMsg('网页版不支持文件夹，请使用桌面应用', false);
+};
 if (HOST) HOST.addEventListener('message', ev => {
   const d = ev.data || {};
   if (d.type === 'picked') {
     if (d.ok) setSel({ kind: 'path', name: d.name, size: d.size, path: d.path });
+    else if (d.error) showMsg(d.error, false);
+  } else if (d.type === 'picked-dir') {
+    if (d.ok) setSel({ kind: 'dir', name: d.name, size: d.bytes, path: d.path, files: d.files });
     else if (d.error) showMsg(d.error, false);
   } else if (d.type === 'done') {
     setBusy(false, 100);
@@ -185,7 +196,7 @@ dz.addEventListener('drop', async e => {
   const f = e.dataTransfer.files[0];
   const entry = e.dataTransfer.items && e.dataTransfer.items[0] && e.dataTransfer.items[0].webkitGetAsEntry
     ? e.dataTransfer.items[0].webkitGetAsEntry() : null;
-  if (entry && entry.isDirectory) { showMsg('拖入的是文件夹，请拖单个文件（或用「选择文件」按钮）', false); return; }
+  if (entry && entry.isDirectory) { showMsg('文件夹请点「选择文件夹」按钮（拖拽只能拖单个文件）', false); return; }
   setSel({ kind: 'mem', name: f.name, size: f.size, file: f });
 });
 dz.onclick = ev => { if (ev.target.tagName !== 'BUTTON') $('pick').onclick(); };
@@ -213,6 +224,16 @@ function waitDone(timeoutMs) {
 
 $('go').onclick = async () => {
   if (!sel || waiting) return;
+  if (sel.kind === 'dir') {
+    waiting = true; setBusy(true, 0);
+    const doneP = HOST ? waitDone(1000 * 1024) : null;
+    HOST.postMessage({ cmd: 'rundir', path: sel.path });
+    const d = await doneP;
+    waiting = false; setBusy(false, 100);
+    if (!d || d.type === 'timeout') { showMsg('任务超时或未完成', false); return; }
+    if (d.type === 'done') showMsg(d.msg + (d.ok && d.saved ? ('　已保存到: ' + d.saved) : ''), d.ok);
+    return;
+  }
   const decompress = isLx(sel.name);
   if (sel.kind === 'path') {
     waiting = true; setBusy(true, 0);
