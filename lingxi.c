@@ -18,11 +18,28 @@
  * 用法: lingxi c <in> <out>   压缩
  *       lingxi d <in> <out>   解压
  */
+#ifndef LX_WASM
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#else
+#include <stddef.h>
+/* freestanding: 本文件尾部提供最小运行时实现 */
+void *memcpy(void *d, const void *s, size_t n);
+void *memset(void *d, int c, size_t n);
+int memcmp(const void *a, const void *b, size_t n);
+void *malloc(size_t n);
+void *calloc(size_t a, size_t b);
+void free(void *p);
+void *realloc(void *p, size_t n);
+void exit(int);
+extern unsigned char __heap_base[];
+static size_t arena_off = 0;
+#define fprintf(...) ((void)0)
+#define stderr ((void *)0)
+#endif
 
 typedef unsigned char  U8;
 typedef unsigned short U16;
@@ -38,46 +55,42 @@ typedef unsigned long long U64;
 #define LSHIFT 12               /* 权重更新右移位数(与LMX共同决定步长) */
 #endif
 #ifndef RATE_CAP
-#define RATE_CAP 2              /* 计数器最终自适应步长 1/2^RATE_CAP */
+#define RATE_CAP 3              /* 计数器最终自适应步长 1/2^RATE_CAP */
 #endif
 #ifndef APM_RATE
-#define APM_RATE 5              /* APM 自适应步长 1/2^APM_RATE */
+#define APM_RATE 6              /* APM 自适应步长 1/2^APM_RATE */
 #endif
+#ifndef MINLEN
 #define MINLEN 6                /* 长程匹配器最小可信匹配 */
+#endif
+#ifndef MBASE
+#define MBASE 1344              /* 匹配置信度基净 */
+#endif
+#ifndef MSTEP
+#define MSTEP 16                /* 每延长一字节增加的置信度 */
+#endif
 
-#define NIN 13                  /* 混合器输入数 */
+#define NIN 17                  /* 混合器输入数 */
 #define PHI 0x9E3779B1u         /* 黄金比例哈希常数 */
 
 /* ================= 概率域变换 (stretch/squash 互逆) ================= */
-static int  stretch_t[4096];    /* p(12bit) -> st(-2047..2047) 对数几率域 */
-static short squash_t[4096];    /* st(-2047..2047) -> p(1..4095) */
-
-static void init_tables(void) {
-    for (int p = 0; p < 4096; p++) {
-        double x = (p + 0.5) / 4096.0;
-        double s = 256.0 * log(x / (1.0 - x));
-        if (s >  2047.0) s =  2047.0;
-        if (s < -2047.0) s = -2047.0;
-        stretch_t[p] = (int)s;
-    }
-    for (int i = 0; i < 4096; i++) {
-        int s = i - 2048;
-        double x = 1.0 / (1.0 + exp(-(double)s / 256.0));
-        int p = (int)(x * 4096.0);
-        if (p < 1) p = 1;
-        if (p > 4095) p = 4095;
-        squash_t[i] = (short)p;
-    }
-}
+#include "tables_gen.h"         /* 固化概率表: 跨编译器/跨目标逐位一致 */
+static void init_tables(void) { }
+#define SQ(s) squash_t[(s) + 2048]
 #define SQ(s) squash_t[(s) + 2048]
 
 static U32 fold(U32 h, U32 c) { return (h + c + 1u) * PHI; }
 
 /* ================= 计数器表 (16位概率 + 8位置信度) ================= */
-typedef struct { U16 *p; U8 *n; U32 mask; } Tbl;
-static Tbl T[10];
-static const U32 TSZ[10] = { 256, 1u<<16, 1u<<17, 1u<<20, 1u<<20,
-                             1u<<21, 1u<<21, 1u<<19, 1u<<19, 1u<<19 };
+/* Cell 交错布局: p/n 同一缓存行, 每模型每比特 1 次缓存未命中。
+   哈希表为 2 路关联: 每桶 2 个候选 + 8 位校验码, 校验不符则
+   确定性地替换置信度较低者 (编码/解码两侧严格一致)。 */
+typedef struct { U16 p; U8 n; U8 chk; } Cell;
+typedef struct { Cell *c; U32 mask; int direct; } Tbl;
+static Tbl T[14];
+static const U32 TSZ[14] = { 256, 1u<<16, 1u<<18, 1u<<21, 1u<<21,
+                             1u<<22, 1u<<22, 1u<<20, 1u<<20, 1u<<20,
+                             1u<<20, 1u<<18, 1u<<18, 1u<<18 };
 /*                     o0     o1       o2       o3       o4
                        o6     o8       sp1      sp2      word     */
 
@@ -93,16 +106,26 @@ static void init_rate(void) {
     }
 }
 
-static inline int stget(int ti, U32 k) {
+/* 哈希表取单元: 2 路关联 + 校验码; 直接表按位取用 */
+static inline Cell *tget(int ti, U32 h, U32 dkey) {
     Tbl *t = &T[ti];
-    k &= t->mask;
-    return stretch_t[t->p[k] >> 4];
+    if (t->direct) return &t->c[dkey & t->mask];
+    U32 b = (h >> 8) & (t->mask >> 1);
+    Cell *c0 = &t->c[b * 2], *c1 = c0 + 1;
+    U32 chk = h & 0xFF;
+    if (c0->chk == chk) return c0;
+    if (c1->chk == chk) return c1;
+    Cell *v = (c0->n < c1->n) ? c0 : c1;
+    v->p = 32768; v->n = 0; v->chk = (U8)chk;
+    return v;
 }
 
 /* ================= 学习型混合器 (c0 索引 256 组权重) ================= */
-static int (*Wmix)[NIN];
+static int Wmix[3][256][NIN];   /* 权重组: [0]=常规 [1]=短匹配 [2]=长匹配(>=16) */
 
-/* ================= 双级概率精修 APM ================= */
+/* ================= 双级概率精修 APM + 学习式终混 ================= */
+static U16 A3[65536 * 33];      /* 上下文: hash(c2,c0) */
+static int W3[256][5];          /* 终混: [st(pr), st(a1), st(a2), st(a3), 恒定] */
 static U16 A1[256 * 33];        /* 上下文: c0 */
 static U16 A2[65536 * 33];      /* 上下文: hash(c1,c0) */
 
@@ -114,10 +137,12 @@ static U32 *MT;                 /* 上下文哈希 -> 下一次出现的位置 *
 /* ================= 全局状态 ================= */
 static U8  *H;                  /* 全历史缓冲 */
 static U32  n;                  /* 已处理字节数(含当前正在编码者待写) */
-static U8   c1, c2, c3, c4, c5, c6, c7, c8;
-static U32  H2v, H3v, H4v, H6v, H8v, SP1v, SP2v, wordH;
+static U8   c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11, c12;
+static U32  H2v, H3v, H4v, H6v, H8v, H12v, SP1v, SP2v, wordH, prevWordH;
 static U8   runB; static U32 runC;
 static U32  mPos; static int mLen;
+static U8  *indT;               /* 间接上下文: 4阶上下文 -> 其历史后继字节 */
+static U32  lineStart, prevLineStart;
 
 static void ctx_hashes(void) {
     H2v  = fold(fold(0, c2), c1);
@@ -125,6 +150,7 @@ static void ctx_hashes(void) {
     H4v  = fold(H3v, c4);
     H6v  = fold(fold(H4v, c5), c6);
     H8v  = fold(fold(H6v, c7), c8);
+    H12v = fold(fold(fold(fold(H8v, c9), c10), c11), c12);
     SP1v = fold(fold(0, c3), c1);
     SP2v = fold(fold(0, c4), c2);
 }
@@ -200,31 +226,56 @@ static inline int dec_bit(int p) {
 /* ================= 核心: 单字节 处理(编码/解码共用同一路径) ================= */
 static int process_byte(int C, int decoding) {
     int  x[NIN];
-    U32  K[10];
+    Cell *CP[14];
     int  y = 0;
 
     for (int i = 0; i < 8; i++) {
         int c0 = (1 << i) | y;   /* 含前导1的部分字节 */
 
         /* ---- 感知层: 11 路预测器 ---- */
-        x[0] = 256;                                  /* 偏置 */
-        K[0] = (U32)c0;                 x[1]  = stget(0, K[0]);   /* o0 */
-        K[1] = ((U32)c1 << 8) | (U32)c0; x[2] = stget(1, K[1]);   /* o1 */
-        K[2] = fold(H2v,  (U32)c0) >> 15; x[3] = stget(2, K[2]);  /* o2 */
-        K[3] = fold(H3v,  (U32)c0) >> 12; x[4] = stget(3, K[3]);  /* o3 */
-        K[4] = fold(H4v,  (U32)c0) >> 12; x[5] = stget(4, K[4]);  /* o4 */
-        K[5] = fold(H6v,  (U32)c0) >> 11; x[6] = stget(5, K[5]);  /* o6 */
-        K[6] = fold(H8v,  (U32)c0) >> 11; x[7] = stget(6, K[6]);  /* o8 */
-        K[7] = fold(SP1v, (U32)c0) >> 13; x[8] = stget(7, K[7]);  /* sp1 */
-        K[8] = fold(SP2v, (U32)c0) >> 13; x[9] = stget(8, K[8]);  /* sp2 */
-        K[9] = fold(wordH,(U32)c0) >> 13; x[10]= stget(9, K[9]);  /* word */
+        x[0] = 256;                                            /* 偏置 */
+        CP[0] = tget(0, 0, (U32)c0);
+        x[1] = stretch_t[CP[0]->p >> 4];                       /* o0 */
+        CP[1] = tget(1, 0, ((U32)c1 << 8) | (U32)c0);
+        x[2] = stretch_t[CP[1]->p >> 4];                       /* o1 */
+        CP[2] = tget(2, fold(H2v,  (U32)c0), 0);
+        x[3] = stretch_t[CP[2]->p >> 4];                       /* o2 */
+        CP[3] = tget(3, fold(H3v,  (U32)c0), 0);
+        x[4] = stretch_t[CP[3]->p >> 4];                       /* o3 */
+        CP[4] = tget(4, fold(H4v,  (U32)c0), 0);
+        x[5] = stretch_t[CP[4]->p >> 4];                       /* o4 */
+        CP[5] = tget(5, fold(H6v,  (U32)c0), 0);
+        x[6] = stretch_t[CP[5]->p >> 4];                       /* o6 */
+        CP[6] = tget(6, fold(H8v,  (U32)c0), 0);
+        x[7] = stretch_t[CP[6]->p >> 4];                       /* o8 */
+        CP[7] = tget(7, fold(SP1v, (U32)c0), 0);
+        x[8] = stretch_t[CP[7]->p >> 4];                       /* sp1 */
+        CP[8] = tget(8, fold(SP2v, (U32)c0), 0);
+        x[9] = stretch_t[CP[8]->p >> 4];                       /* sp2 */
+        CP[9] = tget(9, fold(wordH, (U32)c0), 0);
+        x[10] = stretch_t[CP[9]->p >> 4];                      /* word */
+        CP[10] = tget(10, fold(H12v, (U32)c0), 0);
+        x[13] = stretch_t[CP[10]->p >> 4];                     /* o12 */
+        CP[11] = tget(11, fold(fold(prevWordH, wordH), (U32)c0), 0);
+        x[14] = stretch_t[CP[11]->p >> 4];                     /* wordpair */
+        CP[12] = tget(12, fold((U32)indT[H4v & 0xFFFFFu], (U32)c0), 0);
+        x[15] = stretch_t[CP[12]->p >> 4];                     /* indirect */
+        {   /* 行列模型: 上一行同列字节 */
+            U32 col = n - lineStart;
+            U32 above = 0;
+            if (prevLineStart != lineStart && col < 240 &&
+                prevLineStart + col + 1 < lineStart)
+                above = H[prevLineStart + col];
+            CP[13] = tget(13, fold(fold(0, above), (U32)c0), 0);
+        }
+        x[16] = stretch_t[CP[13]->p >> 4];                     /* line */
 
         int mst = 0;                                 /* 长程匹配 */
         if (mLen > 0) {
             U32 pb = H[mPos];
             if (((pb | 256u) >> (8 - i)) == (U32)c0) {
                 int pb1 = (int)((pb >> (7 - i)) & 1u);
-                int s = 1408 + (mLen > 31 ? 31 : mLen) * 20;
+                int s = MBASE + (mLen > 31 ? 31 : mLen) * MSTEP;
                 if (s > 2047) s = 2047;
                 mst = pb1 ? s : -s;
             } else {
@@ -242,8 +293,9 @@ static int process_byte(int C, int decoding) {
         }
         x[12] = rst;
 
-        /* ---- 决策层: 逻辑斯蒂混合 ---- */
-        int *w = Wmix[c0];
+        /* ---- 决策层: 逻辑斯蒂混合 (权重组按匹配状态选择) ---- */
+        int sel = mLen >= 16 ? 2 : (mLen > 0 ? 1 : 0);
+        int *w = Wmix[sel][c0];
         long long sum = 0;
         for (int j = 0; j < NIN; j++) sum += (long long)w[j] * x[j];
         int st_m = (int)(sum >> 16);
@@ -254,9 +306,17 @@ static int process_byte(int C, int decoding) {
         /* ---- 精修层: 双级 APM ---- */
         int bkt = ((st_m + 2047) * 33) >> 12;
         U32 a2i = (fold((U32)c1, (U32)c0) & 0xFFFFu) * 33u + (U32)bkt;
+        U32 a3i = (fold((U32)c2, (U32)c0) & 0xFFFFu) * 33u + (U32)bkt;
         int a1 = A1[(U32)c0 * 33u + (U32)bkt] >> 4;
         int a2 = A2[a2i] >> 4;
-        int p12 = (pr * 2 + a1 * 2 + a2 * 4) >> 3;
+        int a3 = A3[a3i] >> 4;
+        int yF[5] = { st_m, stretch_t[a1], stretch_t[a2], stretch_t[a3], 256 };
+        long long sF = 0;
+        for (int j = 0; j < 5; j++) sF += (long long)W3[c0][j] * yF[j];
+        int stF = (int)(sF >> 16);
+        if (stF >  2047) stF =  2047;
+        if (stF < -2047) stF = -2047;
+        int p12 = SQ(stF);
         if (p12 < 2) p12 = 2;
         if (p12 > 4094) p12 = 4094;
 
@@ -277,18 +337,26 @@ static int process_byte(int C, int decoding) {
             if (w[j] < -(1 << 20)) w[j] = -(1 << 20);
         }
         U32 tgt = bit ? 65535u : 0u;
-        for (int m = 0; m < 10; m++) {
-            Tbl *t = &T[m];
-            U16 *pp = &t->p[K[m]];
-            U8  *nn = &t->n[K[m]];
-            *pp = (U16)(*pp + (int)((tgt - (U32)*pp) >> RATE[*nn]));
-            if (*nn < 63) ++*nn;
+        for (int m = 0; m < 14; m++) {
+            Cell *cc = CP[m];
+            cc->p = (U16)(cc->p + (int)((tgt - (U32)cc->p) >> RATE[cc->n]));
+            if (cc->n < 63) ++cc->n;
         }
         {
             U16 *q = &A1[(U32)c0 * 33u + (U32)bkt];
             *q = (U16)(*q + (int)((tgt - (U32)*q) >> APM_RATE));
             q = &A2[a2i];
             *q = (U16)(*q + (int)((tgt - (U32)*q) >> APM_RATE));
+            q = &A3[a3i];
+            *q = (U16)(*q + (int)((tgt - (U32)*q) >> APM_RATE));
+        }
+        {
+            int errF = ((bit << 12) - p12) * LMX;
+            for (int j = 0; j < 5; j++) {
+                W3[c0][j] += (yF[j] * errF) >> LSHIFT;
+                if (W3[c0][j] >  (1 << 20)) W3[c0][j] =  (1 << 20);
+                if (W3[c0][j] < -(1 << 20)) W3[c0][j] = -(1 << 20);
+            }
         }
         y = (y << 1) | bit;
     }
@@ -296,6 +364,7 @@ static int process_byte(int C, int decoding) {
     /* ---- 字节边界: 状态演化 ---- */
     int b = y;
     H[n] = (U8)b;
+    indT[H4v & 0xFFFFFu] = (U8)b;   /* 记录该上下文的历史后继 */
 
     /* 匹配键: 当前字节前 6 字节 */
     U32 key = 0;
@@ -324,13 +393,15 @@ static int process_byte(int C, int decoding) {
     MT[key] = n;
 
     n++;
+    if (b == '\n') { prevLineStart = lineStart; lineStart = n; }
+    c12 = c11; c11 = c10; c10 = c9; c9 = c8;
     c8 = c7; c7 = c6; c6 = c5; c5 = c4;
     c4 = c3; c3 = c2; c2 = c1; c1 = (U8)b;
     ctx_hashes();
 
     int alnum = ((b | 0x20) >= 'a' && (b | 0x20) <= 'z') || (b >= '0' && b <= '9');
     if (alnum) wordH = fold(wordH, (U32)(b | 0x20));
-    else       wordH = 0;
+    else { if (wordH) prevWordH = wordH; wordH = 0; }
 
     if ((U8)b == runB) runC++;
     else { runB = (U8)b; runC = 1; }
@@ -339,20 +410,25 @@ static int process_byte(int C, int decoding) {
 }
 
 static void alloc_all(void) {
-    for (int m = 0; m < 10; m++) {
-        T[m].p = (U16 *)calloc(TSZ[m], sizeof(U16));
-        T[m].n = (U8  *)calloc(TSZ[m], sizeof(U8));
+    for (int m = 0; m < 14; m++) {
+        T[m].c = (Cell *)calloc(TSZ[m], sizeof(Cell));
         T[m].mask = TSZ[m] - 1;
-        if (!T[m].p || !T[m].n) { fprintf(stderr, "out of memory\n"); exit(1); }
+        T[m].direct = (m < 2);      /* o0/o1 直接索引, 其余 2 路哈希 */
+        if (!T[m].c) { fprintf(stderr, "out of memory\n"); exit(1); }
     }
-    Wmix = (int (*)[NIN])malloc(256 * sizeof(*Wmix));
+    for (int s = 0; s < 3; s++)
+        for (int c = 0; c < 256; c++)
+            for (int j = 0; j < NIN; j++)
+                Wmix[s][c][j] = 65536 / NIN;      /* 初始权重: 各路均分 */
     for (int c = 0; c < 256; c++)
-        for (int j = 0; j < NIN; j++)
-            Wmix[c][j] = 65536 / NIN;      /* 初始权重: 各路均分 */
+        for (int j = 0; j < 5; j++)
+            W3[c][j] = 65536 / 5;                 /* 终混均分 */
+    for (size_t k = 0; k < sizeof(A3) / sizeof(U16); k++) A3[k] = 32768;
     for (size_t k = 0; k < sizeof(A1) / sizeof(U16); k++) A1[k] = 32768;
     for (size_t k = 0; k < sizeof(A2) / sizeof(U16); k++) A2[k] = 32768;
     MT = (U32 *)calloc(1u << MTBITS, sizeof(U32));
-    if (!MT) { fprintf(stderr, "out of memory\n"); exit(1); }
+    indT = (U8 *)calloc(1u << 20, 1);
+    if (!MT || !indT) { fprintf(stderr, "out of memory\n"); exit(1); }
 }
 
 /* ================= CRC32 ================= */
@@ -372,106 +448,331 @@ static U32 crc32buf(const U8 *b, size_t len) {
     return c ^ 0xFFFFFFFFu;
 }
 
-/* ================= 文件工具 ================= */
-static U8 *load_file(const char *path, size_t *outN) {
+#ifndef LX_WASM
+/* ================= 文件工具(非致命版) ================= */
+static U8 *load_file2(const char *path, size_t *outN, char *msg, size_t msgn) {
     FILE *f = fopen(path, "rb");
-    if (!f) { fprintf(stderr, "cannot open %s\n", path); exit(1); }
+    if (!f) { snprintf(msg, msgn, "无法打开文件: %s", path); return NULL; }
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
     fseek(f, 0, SEEK_SET);
     U8 *buf = (U8 *)malloc((size_t)sz + 1);
-    if (!buf) { fprintf(stderr, "out of memory\n"); exit(1); }
+    if (!buf) { fclose(f); snprintf(msg, msgn, "内存不足"); return NULL; }
     if (sz > 0 && fread(buf, 1, (size_t)sz, f) != (size_t)sz) {
-        fprintf(stderr, "read error %s\n", path); exit(1);
+        fclose(f); free(buf); snprintf(msg, msgn, "读取失败: %s", path); return NULL;
     }
     fclose(f);
     *outN = (size_t)sz;
     return buf;
 }
-static void save_file(const char *path, const U8 *b, size_t len) {
+static int save_file2(const char *path, const U8 *b, size_t len, char *msg, size_t msgn) {
     FILE *f = fopen(path, "wb");
-    if (!f) { fprintf(stderr, "cannot write %s\n", path); exit(1); }
-    if (len && fwrite(b, 1, len, f) != len) { fprintf(stderr, "write error\n"); exit(1); }
+    if (!f) { snprintf(msg, msgn, "无法写出文件: %s", path); return 1; }
+    if (len && fwrite(b, 1, len, f) != len) {
+        fclose(f); snprintf(msg, msgn, "写入失败: %s", path); return 1;
+    }
     fclose(f);
+    return 0;
 }
+#endif /* !LX_WASM */
 
 /* ================= 主流程 ================= */
 static void reset_state(void) {
-    c1 = c2 = c3 = c4 = c5 = c6 = c7 = c8 = 0;
-    H2v = H3v = H4v = H6v = H8v = SP1v = SP2v = wordH = 0;
+    c1 = c2 = c3 = c4 = c5 = c6 = c7 = c8 = c9 = c10 = c11 = c12 = 0;
+    H2v = H3v = H4v = H6v = H8v = H12v = SP1v = SP2v = wordH = prevWordH = 0;
     runB = 0; runC = 0; mPos = 0; mLen = 0; n = 0;
+    lineStart = prevLineStart = 0;
 }
 
+/* ---------- 引擎生命周期 (供常驻 GUI 低占用使用) ---------- */
+static int g_eng_init = 0;
+static void ensure_init(void) {
+    if (g_eng_init) return;
+    init_tables(); init_rate(); crc_init(); alloc_all();
+    g_eng_init = 1;
+}
+void lx_shutdown(void) {           /* 释放全部大表, 进程回到 ~1MB 常驻 */
+    if (!g_eng_init) return;
+    for (int m = 0; m < 14; m++) { free(T[m].c); T[m].c = NULL; }
+    free(MT); free(indT); MT = NULL; indT = NULL;
+    g_eng_init = 0;
+#ifdef LX_WASM
+    arena_off = 0;              /* 整个 arena 归零, 下个作业重新分配 */
+#endif
+}
+void (*lx_progress_cb)(int percent) = NULL;   /* 0..100, 可为 NULL */
+
+/* ---------- 文件到文件 API: 成功返回 0, 失败返回 1, msg 带中文详情 ---------- */
+#ifndef LX_WASM
+int lx_compress_file(const char *inpath, const char *outpath,
+                     char *msg, size_t msgn) {
+    lx_shutdown();      /* 每个作业从出厂状态开始: 编解码状态必须严格一致 */
+    ensure_init();
+    clock_t t0 = clock();
+    size_t inN;
+    U8 *in = load_file2(inpath, &inN, msg, msgn);
+    if (!in) return 1;
+    reset_state();
+    H = (U8 *)calloc(inN + 65536, 1);
+    if (!H) { free(in); snprintf(msg, msgn, "内存不足"); return 1; }
+    ctx_hashes();
+    rc_init_enc();
+    for (size_t k = 0; k < inN; k++) {
+        process_byte(in[k], 0);
+        if (lx_progress_cb && (k & 0xFFFF) == 0)
+            lx_progress_cb((int)(k * 100 / (inN ? inN : 1)));
+    }
+    rc_flush();
+
+    /* 文件头: "LX1" + 原始长度(8LE) + CRC32(4LE) */
+    U8 hdr[15];
+    memcpy(hdr, "LX1", 3);
+    U64 sz64 = (U64)inN;
+    for (int k = 0; k < 8; k++) hdr[3 + k] = (U8)(sz64 >> (8 * k));
+    U32 crc = crc32buf(in, inN);
+    for (int k = 0; k < 4; k++) hdr[11 + k] = (U8)(crc >> (8 * k));
+
+    FILE *f = fopen(outpath, "wb");
+    if (!f) {
+        free(in); free(H); H = NULL;
+        free(obuf); obuf = NULL; ocap = 0; olen = 0;
+        snprintf(msg, msgn, "无法写出文件: %s", outpath);
+        return 1;
+    }
+    fwrite(hdr, 1, 15, f);
+    if (olen) fwrite(obuf, 1, olen, f);
+    fclose(f);
+    size_t outN = 15 + olen;
+    free(in); free(H); H = NULL;
+    free(obuf); obuf = NULL; ocap = 0; olen = 0;
+    {
+        double secs = (double)(clock() - t0) / CLOCKS_PER_SEC;
+        double bpc = inN ? (double)outN * 8.0 / (double)inN : 0.0;
+        snprintf(msg, msgn, "压缩完成: %zu -> %zu 字节 (%.2f%%, %.4f bpc), 用时 %.2fs",
+                 inN, outN, inN ? outN * 100.0 / inN : 0.0, bpc, secs);
+    }
+    return 0;
+}
+
+int lx_decompress_file(const char *inpath, const char *outpath,
+                       char *msg, size_t msgn) {
+    lx_shutdown();      /* 每个作业从出厂状态开始(与编码端一致) */
+    ensure_init();
+    clock_t t0 = clock();
+    size_t inN;
+    U8 *in = load_file2(inpath, &inN, msg, msgn);
+    if (!in) return 1;
+    if (inN < 15 || memcmp(in, "LX1", 3) != 0) {
+        free(in); snprintf(msg, msgn, "不是灵犀文件(头错误): %s", inpath);
+        return 1;
+    }
+    U64 sz64 = 0;
+    for (int k = 0; k < 8; k++) sz64 |= (U64)in[3 + k] << (8 * k);
+    U32 want = 0;
+    for (int k = 0; k < 4; k++) want |= (U32)in[11 + k] << (8 * k);
+    size_t N = (size_t)sz64;
+
+    U8 *out = (U8 *)malloc(N + 1);
+    H = (U8 *)calloc(N + 65536, 1);
+    if (!out || !H) { free(in); free(out); free(H); H = NULL;
+                      snprintf(msg, msgn, "内存不足"); return 1; }
+    reset_state();
+    ctx_hashes();
+    ibuf = in + 15; ipos = 0; isize = inN - 15;
+    rc_init_dec();
+    for (size_t k = 0; k < N; k++) {
+        out[k] = (U8)process_byte(-1, 1);
+        if (lx_progress_cb && (k & 0xFFFF) == 0)
+            lx_progress_cb((int)(k * 100 / (N ? N : 1)));
+    }
+    U32 got = crc32buf(out, N);
+    free(in); free(H); H = NULL;
+    if (got != want) {
+        free(out);
+        snprintf(msg, msgn, "校验失败! 数据损坏 (CRC %08x != %08x)", got, want);
+        return 1;
+    }
+    int rc = save_file2(outpath, out, N, msg, msgn);
+    free(out);
+    if (rc == 0) {
+        double secs = (double)(clock() - t0) / CLOCKS_PER_SEC;
+        snprintf(msg, msgn, "解压完成: %zu 字节, CRC 校验通过, 用时 %.2fs", N, secs);
+    }
+    return rc;
+}
+
+#endif /* !LX_WASM */
+
+#ifdef LX_WASM
+/* ================= WASM 内存作业 API (供浏览器调用) ================= */
+static unsigned int g_n_total;          /* 压缩: 待编码总字节数 */
+static U8  *d_out;                      /* 解压: 输出缓冲 */
+static unsigned int d_total, d_pos, d_want;
+static U8  *out_g; static unsigned int out_len_g;
+
+__attribute__((export_name("lx_ver")))
+int lx_ver(void) { return 202; }
+
+/* JS 先分配输入缓冲并写入文件字节, 再调 c/d_start。
+   input_end = 输入块结束: 解压重置保留输入(其后的上一作业内存全部回收);
+   压缩不经输入缓冲(直写 H), 完整归零重置 */
+static size_t input_end = 0;
+__attribute__((export_name("lx_in_alloc")))
+unsigned char *lx_in_alloc(unsigned int n) {
+    unsigned char *p = (unsigned char *)calloc(1u, n);
+    input_end = arena_off;
+    return p;
+}
+
+__attribute__((export_name("lx_c_start")))
+int lx_c_start(unsigned int n) {
+    arena_off = 0; g_eng_init = 0;          /* 完整出厂重置 */
+    ensure_init();
+    H = (U8 *)calloc((size_t)n + 65536u, 1u);
+    if (!H) return -1;
+    g_n_total = n;
+    reset_state(); ctx_hashes(); rc_init_enc();
+    return 0;
+}
+
+__attribute__((export_name("lx_c_hbuf")))
+unsigned char *lx_c_hbuf(void) { return H; }
+
+/* 区间 [from,to) 的字节已在 H 中, 逐字节编码; 返回推进到的位置 */
+__attribute__((export_name("lx_c_run")))
+int lx_c_run(unsigned int from, unsigned int to) {
+    if (to > g_n_total) to = g_n_total;
+    for (unsigned int k = from; k < to; k++) process_byte(H[k], 0);
+    return (int)to;
+}
+
+__attribute__((export_name("lx_c_end")))
+int lx_c_end(void) {
+    rc_flush();
+    U8 hdr[15];
+    memcpy(hdr, "LX1", 3);
+    U64 sz64 = (U64)g_n_total;
+    for (int k = 0; k < 8; k++) hdr[3 + k] = (U8)(sz64 >> (8 * k));
+    U32 crc = crc32buf(H, g_n_total);
+    for (int k = 0; k < 4; k++) hdr[11 + k] = (U8)(crc >> (8 * k));
+    unsigned int total = 15u + (unsigned int)olen;
+    U8 *out = (U8 *)malloc(total);
+    if (!out) return -2;
+    memcpy(out, hdr, 15);
+    if (olen) memcpy(out + 15, obuf, olen);
+    out_g = out; out_len_g = total;
+    free(H); H = NULL; free(obuf); obuf = NULL; ocap = 0; olen = 0;
+    return (int)total;
+}
+
+/* 输入 = 完整 .lx 字节 (JS 已写入 in 缓冲并传指针) */
+__attribute__((export_name("lx_d_start")))
+int lx_d_start(unsigned char *in, unsigned int inN) {
+    arena_off = input_end; g_eng_init = 0;  /* 重置时保留输入缓冲 */
+    ensure_init();
+    if (inN < 15 || memcmp(in, "LX1", 3) != 0) return -1;
+    U64 sz64 = 0;
+    for (int k = 0; k < 8; k++) sz64 |= (U64)in[3 + k] << (8 * k);
+    U32 want = 0;
+    for (int k = 0; k < 4; k++) want |= (U32)in[11 + k] << (8 * k);
+    if (sz64 > 1024u * 1024 * 1024) return -4;
+    size_t N = (size_t)sz64;
+    d_out = (U8 *)malloc(N + 1);
+    H = (U8 *)calloc(N + 65536u, 1u);
+    if (!d_out || !H) return -2;
+    reset_state(); ctx_hashes();
+    ibuf = in + 15; ipos = 0; isize = inN - 15;
+    rc_init_dec();
+    d_total = (unsigned int)N; d_pos = 0; d_want = want;
+    return (int)N;
+}
+
+__attribute__((export_name("lx_d_run")))
+int lx_d_run(unsigned int to) {
+    if (to > d_total) to = d_total;
+    for (unsigned int k = d_pos; k < to; k++) d_out[k] = (U8)process_byte(-1, 1);
+    d_pos = to;
+    return (int)to;
+}
+
+__attribute__((export_name("lx_d_end")))
+int lx_d_end(void) {
+    U32 got = crc32buf(d_out, d_total);
+    free(H); H = NULL;
+    if (got != d_want) return -3;
+    out_g = d_out; out_len_g = d_total;
+    return (int)d_total;
+}
+
+__attribute__((export_name("lx_out_ptr")))
+unsigned char *lx_out_ptr(void) { return out_g; }
+__attribute__((export_name("lx_out_len")))
+unsigned int lx_out_len(void) { return out_len_g; }
+#endif /* LX_WASM */
+
+#ifndef LX_NO_MAIN
 int main(int argc, char **argv) {
     if (argc < 4 || (argv[1][0] != 'c' && argv[1][0] != 'd')) {
         fprintf(stderr, "用法: %s c|d <输入> <输出>\n", argv[0]);
         return 2;
     }
-    int decode = (argv[1][0] == 'd');
-    init_tables();
-    init_rate();
-    crc_init();
-    alloc_all();
+    char msg[512];
+    int rc = (argv[1][0] == 'c')
+        ? lx_compress_file(argv[2], argv[3], msg, sizeof(msg))
+        : lx_decompress_file(argv[2], argv[3], msg, sizeof(msg));
+    fprintf(stderr, "灵犀: %s\n", msg);
+    return rc;
+}
+#endif
 
-    clock_t t0 = clock();
-    size_t inN;
-    U8 *in = load_file(argv[2], &inN);
-
-    if (!decode) {
-        reset_state();
-        H = (U8 *)calloc(inN + 65536, 1);
-        if (!H) { fprintf(stderr, "out of memory\n"); return 1; }
-        ctx_hashes();
-        rc_init_enc();
-        for (size_t k = 0; k < inN; k++) process_byte(in[k], 0);
-        rc_flush();
-
-        /* 文件头: "LX1" + 原始长度(8LE) + CRC32(4LE) */
-        U8 hdr[15];
-        memcpy(hdr, "LX1", 3);
-        U64 sz64 = (U64)inN;
-        for (int k = 0; k < 8; k++) hdr[3 + k] = (U8)(sz64 >> (8 * k));
-        U32 crc = crc32buf(in, inN);
-        for (int k = 0; k < 4; k++) hdr[11 + k] = (U8)(crc >> (8 * k));
-
-        FILE *f = fopen(argv[3], "wb");
-        if (!f) { fprintf(stderr, "cannot write %s\n", argv[3]); return 1; }
-        fwrite(hdr, 1, 15, f);
-        if (olen) fwrite(obuf, 1, olen, f);
-        fclose(f);
-
-        double secs = (double)(clock() - t0) / CLOCKS_PER_SEC;
-        double bpc = inN ? (double)(15 + olen) * 8.0 / (double)inN : 0.0;
-        fprintf(stderr, "灵犀: %zu -> %zu 字节 (%.4f bpc) 压缩用时 %.2fs\n",
-                inN, 15 + olen, bpc, secs);
-    } else {
-        if (inN < 15 || memcmp(in, "LX1", 3) != 0) {
-            fprintf(stderr, "不是灵犀文件(头错误)\n");
-            return 1;
-        }
-        U64 sz64 = 0;
-        for (int k = 0; k < 8; k++) sz64 |= (U64)in[3 + k] << (8 * k);
-        U32 want = 0;
-        for (int k = 0; k < 4; k++) want |= (U32)in[11 + k] << (8 * k);
-        size_t N = (size_t)sz64;
-
-        U8 *out = (U8 *)malloc(N + 1);
-        H = (U8 *)calloc(N + 65536, 1);
-        if (!out || !H) { fprintf(stderr, "out of memory\n"); return 1; }
-        reset_state();
-        ctx_hashes();
-        ibuf = in + 15; ipos = 0; isize = inN - 15;
-        rc_init_dec();
-        for (size_t k = 0; k < N; k++) out[k] = (U8)process_byte(-1, 1);
-
-        U32 got = crc32buf(out, N);
-        if (got != want) {
-            fprintf(stderr, "校验失败! CRC %08x != %08x\n", got, want);
-            return 1;
-        }
-        save_file(argv[3], out, N);
-        double secs = (double)(clock() - t0) / CLOCKS_PER_SEC;
-        fprintf(stderr, "灵犀: 解压 %zu 字节, CRC 校验通过, 用时 %.2fs\n", N, secs);
+#ifdef LX_WASM
+/* ---------- freestanding 最小运行时: arena 分配器 + 内存原语 ---------- */
+static void *arena_alloc(size_t n) {
+    size_t total = (n + 15u) & ~(size_t)15u;       /* 16字节对齐 + 尺寸头 */
+    total += 16u;
+    unsigned char *base = (unsigned char *)&__heap_base;
+    size_t cur = (size_t)__builtin_wasm_memory_size(0) << 16;
+    size_t end = (size_t)base + arena_off + total;
+    if (end > cur) {
+        size_t pages = ((end - cur) + 65535u) >> 16;
+        if (__builtin_wasm_memory_grow(0, (int)pages) < 0) return 0;
     }
+    unsigned char *p = base + arena_off;
+    arena_off += total;
+    ((size_t *)p)[0] = n;                          /* 头: 有效负载尺寸 */
+    return p + 16;
+}
+void *malloc(size_t n) { return arena_alloc(n); }
+void *calloc(size_t a, size_t b) {
+    size_t n = a * b;
+    unsigned char *p = (unsigned char *)arena_alloc(n);
+    if (p) { size_t head = ((size_t *)p)[-1]; (void)head;
+             for (size_t i = 0; i < n; i++) p[i] = 0; }
+    return p;
+}
+void free(void *p) { (void)p; }                    /* arena: 作业结束整体重置 */
+void *realloc(void *p, size_t n) {
+    void *q = malloc(n);
+    if (q && p) {
+        size_t old = ((size_t *)p)[-1];
+        memcpy(q, p, old < n ? old : n);
+    }
+    return q;
+}
+void *memcpy(void *d, const void *s, size_t n) {
+    unsigned char *dd = (unsigned char *)d;
+    const unsigned char *ss = (const unsigned char *)s;
+    for (size_t i = 0; i < n; i++) dd[i] = ss[i];
+    return d;
+}
+void *memset(void *d, int c, size_t n) {
+    unsigned char *dd = (unsigned char *)d;
+    for (size_t i = 0; i < n; i++) dd[i] = (unsigned char)c;
+    return d;
+}
+int memcmp(const void *a, const void *b, size_t n) {
+    const unsigned char *aa = (const unsigned char *)a, *bb = (const unsigned char *)b;
+    for (size_t i = 0; i < n; i++) { if (aa[i] != bb[i]) return aa[i] < bb[i] ? -1 : 1; }
     return 0;
 }
+#endif

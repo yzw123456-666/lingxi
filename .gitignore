@@ -9,3 +9,9 @@ __pycache__/
 
 # 语料由 gen_corpus.py 再生（含系统 DLL，不入库）
 corpus/
+selftest_report.txt
+lx_debug.txt
+*.wasm
+*.pdb
+t_utf8*
+LingXiBox_dbg*
