@@ -1,0 +1,11 @@
+# 构建产物与测试中间物
+*.exe
+*.pdb
+*.lx
+*.out
+tmp/
+tmp*/
+__pycache__/
+
+# 语料由 gen_corpus.py 再生（含系统 DLL，不入库）
+corpus/
