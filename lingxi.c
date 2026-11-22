@@ -686,7 +686,7 @@ int lx_d_start(unsigned char *in, unsigned int inN) {
     for (int k = 0; k < 8; k++) sz64 |= (U64)in[3 + k] << (8 * k);
     U32 want = 0;
     for (int k = 0; k < 4; k++) want |= (U32)in[11 + k] << (8 * k);
-    if (sz64 > 1024u * 1024 * 1024) return -4;
+    if (sz64 > 3ull * 1024 * 1024 * 1024) return -4;   /* wasm 32位地址空间实际边界 */
     size_t N = (size_t)sz64;
     d_out = (U8 *)malloc(N + 1);
     H = (U8 *)calloc(N + 65536u, 1u);

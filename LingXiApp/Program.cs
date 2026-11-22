@@ -397,7 +397,6 @@ public class MainForm : Form
         foreach (var h in headText.Split("\r\n"))
             if (h.StartsWith("Content-Length:", StringComparison.OrdinalIgnoreCase))
                 clen = long.Parse(h.Substring(15).Trim());
-        if (clen > 1024L * 1024 * 1024) throw new IOException("body too big (max 1GB)");
 
         // 请求体 -> 临时文件 (流式; 头缓冲里可能已含部分请求体)
         string bodyFile = "";

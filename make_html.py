@@ -76,7 +76,7 @@ label.sw input{accent-color:var(--ac);width:16px;height:16px}
   <div class="d1">把文件拖到这里</div>
   <div class="d2">或</div>
   <button id="pick">选择文件</button>
-  <div class="hint">普通文件 → 压缩为 .lx &nbsp;·&nbsp; .lx 文件 → 解压还原（自动识别）&nbsp;·&nbsp; 建议不超过 300MB</div>
+  <div class="hint">普通文件 → 压缩为 .lx &nbsp;·&nbsp; .lx 文件 → 解压还原（自动识别）&nbsp;·&nbsp; 受浏览器内存约束, 超大文件请用桌面版</div>
  </div>
  <input type="file" id="file" hidden>
  <div class="fi" id="fi" hidden>已选: <b id="fn"></b> <span id="fs"></span></div>
@@ -102,7 +102,7 @@ const fmt = n => n > 1048576 ? (n/1048576).toFixed(2)+' MB' : n > 1024 ? (n/1024
 let E = null, mem = null, file = null, lastBlob = null, lastName = '';
 const isLx = n => n.toLowerCase().endsWith('.lx');
 const yieldUI = () => new Promise(r => setTimeout(r, 0));
-const ERR = {'-1':'不是灵犀文件(缺少 LX1 头)','-2':'内存不足','-3':'CRC 校验失败: 数据已损坏','-4':'文件超过 1GB 上限'};
+const ERR = {'-1':'不是灵犀文件(缺少 LX1 头)','-2':'内存不足','-3':'CRC 校验失败: 数据已损坏','-4':'内存不足: 文件超出浏览器可处理范围 (约3GB), 超大文件请用桌面版'};
 const errText = rc => ERR[String(rc)] || ('引擎错误 ' + rc);
 
 /* ---------- 主题: 默认浅色, 可切换深色并记忆 ---------- */
@@ -177,7 +177,6 @@ function freshU8() { return new Uint8Array(mem.buffer); }
 
 async function runJob(decompress) {
   const n = file.size;
-  if (n > 1024 * 1024 * 1024) { showMsg('文件超过 1GB 上限', false); return null; }
   setBusy(true, 0);
   try {
     let rc, total;

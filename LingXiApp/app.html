@@ -124,7 +124,7 @@ function updateSelUI() {
   $('fi').hidden = false;
   $('fn').textContent = sel.name;
   $('fs').textContent = ' (' + fmt(sel.size) + ')';
-  $('fp').textContent = sel.kind === 'path' ? ('路径: ' + sel.path) : '（拖拽模式：整文件读入内存，最大建议 300MB）';
+  $('fp').textContent = sel.kind === 'path' ? ('路径: ' + sel.path) : '（拖拽模式：整文件读入内存；超大文件请用「选择文件」模式，磁盘直读无限制）';
   const lx = isLx(sel.name);
   $('mode').textContent = lx ? '模式: 解压还原' : '模式: 压缩';
   $('mode').className = 'mode ' + (lx ? 'd' : 'c');
