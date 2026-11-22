@@ -208,6 +208,51 @@ public class MainForm : Form
             acc.Add((prefix + f.Name, false, f.Length, f.FullName));
     }
 
+    const long LxfCmThreshold = 4L * 1024 * 1024;    /* > 4MB 的文件做采样决策 */
+    const int LxfSampleSize = 256 * 1024;
+
+    /* 采样决策: 压缩前 256KB; 压缩率 > 0.90 → 已压缩数据 → 存储而非建模 */
+    static bool SampleIncompressible(string file)
+    {
+        var sample = Path.Combine(Path.GetTempPath(), "lxapp_smp_" + Guid.NewGuid().ToString("N") + ".bin");
+        var comp = sample + ".lx";
+        try
+        {
+            using (var s1 = File.OpenRead(file))
+            using (var d1 = File.Create(sample))
+            {
+                var buf = new byte[1 << 16];
+                int left = LxfSampleSize, k;
+                while (left > 0 && (k = s1.Read(buf, 0, Math.Min(left, buf.Length))) > 0)
+                { d1.Write(buf, 0, k); left -= k; }
+            }
+            var smsg = new byte[1024];
+            var rc = lx_compress_file(sample, comp, smsg, smsg.Length);
+            if (rc != 0) return false;
+            long sampleLen = Math.Min(LxfSampleSize, new FileInfo(file).Length);
+            return new FileInfo(comp).Length * 1.0 / sampleLen > 0.90;
+        }
+        catch { return false; }
+        finally { TryDelete(sample); TryDelete(comp); }
+    }
+
+    /* 单文件完整建模压缩 → 返回 LX1 流字节 (LXF2 条目载荷, method 1) */
+    static byte[] CompressToLxBytes(string file)
+    {
+        var tmp = Path.Combine(Path.GetTempPath(), "lxapp_e_" + Guid.NewGuid().ToString("N") + ".lx");
+        try
+        {
+            var sb = new byte[1024];
+            var cmsg = new byte[1024];
+            lx_compress_file(file, tmp, cmsg, cmsg.Length);
+            return File.ReadAllBytes(tmp);
+        }
+        finally { TryDelete(tmp); }
+    }
+
+    // ---------- 文件夹归档 LXF2: 容器不整体压缩, 逐文件方法决策 ----------
+    // method 0 = 原样存储 (已压缩数据, 磁盘直拷); method 1 = 逐文件 LX1 流 (完整建模)
+    // 格式: "LXF2" + u32 条目数 + N×[u16 路径长 + UTF-8 路径 + u8 isDir + u8 method + u64 payloadSize] + N 个载荷
     static void PackFolder(string dir, string outLxf)
     {
         var root = new DirectoryInfo(dir);
@@ -215,22 +260,58 @@ public class MainForm : Form
         CollectEntries(root, "", entries);
         entries.Sort((a, b) => string.CompareOrdinal(a.rel, b.rel));
 
-        using var outf = new FileStream(outLxf, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20);
-        outf.Write(Encoding.ASCII.GetBytes(LxfMagic));
-        outf.Write(BitConverter.GetBytes((uint)entries.Count));
-        foreach (var e in entries)
+        var tmpDir = Path.Combine(Path.GetTempPath(), "lxapp_pack_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tmpDir);
+        try
         {
-            var pb = Encoding.UTF8.GetBytes(e.rel);
-            outf.Write(BitConverter.GetBytes((ushort)pb.Length));
-            outf.Write(pb);
-            outf.Write(new byte[] { (byte)(e.isDir ? 1 : 0) });
-            outf.Write(BitConverter.GetBytes((ulong)e.size));
+            // 阶段 1: 逐文件决策 + 生成载荷 (可压缩 → LX1 流; 已压缩 → 原样引用)
+            var methods = new byte[entries.Count];
+            var payloadFiles = new string[entries.Count];
+            var payloadSizes = new long[entries.Count];
+            int idx = 0;
+            foreach (var e in entries)
+            {
+                progressPct = idx * 40 / Math.Max(1, entries.Count);
+                if (e.isDir) { methods[idx] = 0; payloadSizes[idx] = 0; payloadFiles[idx] = null; }
+                else if (e.size > LxfCmThreshold && SampleIncompressible(e.full))
+                { methods[idx] = 0; payloadFiles[idx] = e.full; payloadSizes[idx] = e.size; }
+                else
+                {
+                    methods[idx] = 1;
+                    payloadFiles[idx] = Path.Combine(tmpDir, idx + ".lx");
+                    var sb = new byte[1024];
+                    lx_compress_file(e.full, payloadFiles[idx], sb, sb.Length);
+                    payloadSizes[idx] = new FileInfo(payloadFiles[idx]).Length;
+                }
+                idx++;
+            }
+
+            // 阶段 2: 写容器 (清单含 method+payloadSize, 载荷顺序拼接)
+            using var outf = new FileStream(outLxf, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20);
+            outf.Write(Encoding.ASCII.GetBytes("LXF2"));
+            outf.Write(BitConverter.GetBytes((uint)entries.Count));
+            for (int i = 0; i < entries.Count; i++)
+            {
+                var pb = Encoding.UTF8.GetBytes(entries[i].rel);
+                outf.Write(BitConverter.GetBytes((ushort)pb.Length));
+                outf.Write(pb);
+                outf.Write(new byte[] { (byte)(entries[i].isDir ? 1 : 0), methods[i] });
+                outf.Write(BitConverter.GetBytes((ulong)payloadSizes[i]));
+            }
+            long totalPayload = payloadSizes.Sum();
+            long donePayload = 0;
+            for (int i = 0; i < entries.Count; i++)
+            {
+                if (payloadFiles[i] == null) continue;
+                using var pf = new FileStream(payloadFiles[i], FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20);
+                pf.CopyTo(outf);
+                donePayload += payloadSizes[i];
+                progressPct = 40 + (int)(donePayload * 60 / Math.Max(1, totalPayload));
+            }
         }
-        foreach (var e in entries)
+        finally
         {
-            if (e.isDir) continue;
-            using var fs = new FileStream(e.full, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20);
-            fs.CopyTo(outf);
+            try { Directory.Delete(tmpDir, true); } catch { }
         }
     }
 
@@ -248,7 +329,8 @@ public class MainForm : Form
         using var f = File.OpenRead(file);
         var m = new byte[4];
         if (f.Read(m, 0, 4) < 4) return false;
-        return Encoding.ASCII.GetString(m) == LxfMagic;
+        var s = Encoding.ASCII.GetString(m);
+        return s == "LXF2" || s == "LXF1";
     }
 
     static (int files, int dirs) ExtractFolder(string lxf, string destDir)
@@ -256,25 +338,29 @@ public class MainForm : Form
         using var f = new FileStream(lxf, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20);
         var magic = new byte[4];
         f.ReadExactly(magic, 0, 4);
-        if (Encoding.ASCII.GetString(magic) != LxfMagic) throw new IOException("不是文件夹归档");
+        var magicStr = Encoding.ASCII.GetString(magic);
+        if (magicStr != "LXF2" && magicStr != "LXF1") throw new IOException("不是文件夹归档");
+        bool hasMethod = magicStr == "LXF2";
         var cnt = new byte[4];
         f.ReadExactly(cnt, 0, 4);
         uint count = BitConverter.ToUInt32(cnt, 0);
-        var meta = new List<(string rel, bool isDir, ulong size)>();
+        var meta = new List<(string rel, bool isDir, byte method, ulong psize)>();
         for (uint i = 0; i < count; i++)
         {
             var lb = new byte[2]; f.ReadExactly(lb, 0, 2);
             ushort pl = BitConverter.ToUInt16(lb, 0);
             var pb = new byte[pl]; f.ReadExactly(pb, 0, pl);
-            var fl = new byte[1]; f.ReadExactly(fl, 0, 1);
+            var fl = new byte[hasMethod ? 2 : 1]; f.ReadExactly(fl, 0, fl.Length);
             var zb = new byte[8]; f.ReadExactly(zb, 0, 8);
-            meta.Add((Encoding.UTF8.GetString(pb), fl[0] == 1, BitConverter.ToUInt64(zb, 0)));
+            byte method = hasMethod ? fl[1] : (byte)0;
+            meta.Add((Encoding.UTF8.GetString(pb), fl[0] == 1, method, BitConverter.ToUInt64(zb, 0)));
         }
         Directory.CreateDirectory(destDir);
         int files = 0, dirs = 0;
         long doneBytes = 0;
-        long totalBytes = meta.Sum(m => (long)m.size);
-        foreach (var (rel, isDir, size) in meta)
+        long totalBytes = meta.Sum(m => (long)m.psize);
+        string tmpLx = Path.Combine(Path.GetTempPath(), "lxapp_x_" + Guid.NewGuid().ToString("N") + ".lx");
+        foreach (var (rel, isDir, method, psize) in meta)
         {
             var target = Path.Combine(destDir, SafeRel(rel).Replace('/', Path.DirectorySeparatorChar));
             if (isDir)
@@ -283,20 +369,44 @@ public class MainForm : Form
                 continue;
             }
             Directory.CreateDirectory(Path.GetDirectoryName(target)!);
-            using var fs = new FileStream(target, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20);
-            var buf = new byte[1 << 16];
-            ulong left = size;
-            while (left > 0)
+            if (method == 1)
             {
-                int chunk = (int)Math.Min(left, (ulong)buf.Length);
-                f.ReadExactly(buf, 0, chunk);
-                fs.Write(buf, 0, chunk);
-                left -= (ulong)chunk;
+                // 条目载荷 = 完整 LX1 流: 落盘后交给引擎解压
+                using (var lx = new FileStream(tmpLx, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20))
+                {
+                    var buf = new byte[1 << 16];
+                    ulong left = psize;
+                    while (left > 0)
+                    {
+                        int chunk = (int)Math.Min(left, (ulong)buf.Length);
+                        f.ReadExactly(buf, 0, chunk);
+                        lx.Write(buf, 0, chunk);
+                        left -= (ulong)chunk;
+                    }
+                }
+                var xmsg = new byte[1024]; lx_decompress_file(tmpLx, target, xmsg, xmsg.Length);
+                TryDelete(tmpLx);
+                doneBytes += (long)psize;
+                progressPct = (int)(doneBytes * 100 / Math.Max(1, totalBytes));
+                files++;
+                continue;
+            }
+            // method 0: 原始存储, 流式拷贝
+            using var fs = new FileStream(target, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20);
+            var buf2 = new byte[1 << 16];
+            ulong left2 = psize;
+            while (left2 > 0)
+            {
+                int chunk = (int)Math.Min(left2, (ulong)buf2.Length);
+                f.ReadExactly(buf2, 0, chunk);
+                fs.Write(buf2, 0, chunk);
+                left2 -= (ulong)chunk;
                 doneBytes += chunk;
-                progressPct = (int)(doneBytes * 100 / (totalBytes == 0 ? 1 : totalBytes));
+                progressPct = (int)(doneBytes * 100 / Math.Max(1, totalBytes));
             }
             files++;
         }
+        TryDelete(tmpLx);
         return (files, dirs);
     }
 
@@ -305,7 +415,9 @@ public class MainForm : Form
         using var f = new FileStream(lxf, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20);
         var magic = new byte[4];
         f.ReadExactly(magic, 0, 4);
-        if (Encoding.ASCII.GetString(magic) != LxfMagic) throw new IOException("不是文件夹归档");
+        var magicStr = Encoding.ASCII.GetString(magic);
+        if (magicStr != "LXF2" && magicStr != "LXF1") throw new IOException("不是文件夹归档");
+        bool hasMethod = magicStr == "LXF2";
         var cnt = new byte[4];
         f.ReadExactly(cnt, 0, 4);
         uint count = BitConverter.ToUInt32(cnt, 0);
@@ -316,7 +428,7 @@ public class MainForm : Form
             var lb = new byte[2]; f.ReadExactly(lb, 0, 2);
             ushort pl = BitConverter.ToUInt16(lb, 0);
             var pb = new byte[pl]; f.ReadExactly(pb, 0, pl);
-            var fl = new byte[1]; f.ReadExactly(fl, 0, 1);
+            var fl = new byte[hasMethod ? 2 : 1]; f.ReadExactly(fl, 0, fl.Length);
             var zb = new byte[8]; f.ReadExactly(zb, 0, 8);
             var sz = BitConverter.ToUInt64(zb, 0);
             meta.Add((Encoding.UTF8.GetString(pb), fl[0] == 1, sz));
@@ -442,8 +554,8 @@ public class MainForm : Form
         {
             var head = new byte[15];
             using (var fs = File.OpenRead(lxPath))
-                if (fs.Read(head) < 15 || Encoding.ASCII.GetString(head, 0, 3) != "LX1")
-                    return (1, "不是灵犀文件: 缺少 LX1 头", "", false);
+                if (fs.Read(head) < 15 || (Encoding.ASCII.GetString(head, 0, 3) != "LX1" && Encoding.ASCII.GetString(head, 0, 3) != "LX0"))
+                    return (1, "不是灵犀文件: 缺少 LX1/LX0 头", "", false);
             int rc = lx_decompress_file(lxPath, tout, sb, sb.Length);
             var msg = MsgOf(sb);
             if (rc != 0) { TryDelete(tout); return (rc, msg, "", false); }

@@ -545,11 +545,92 @@ LXAPI void lx_set_progress(void (*cb)(int)) { lx_progress_cb = cb; }
 
 /* ---------- 文件到文件 API: 成功返回 0, 失败返回 1, msg 带中文详情 ---------- */
 #ifndef LX_WASM
+#ifndef STORE_THRESHOLD
+#define STORE_THRESHOLD (4ull * 1024 * 1024)    /* 超过 4MB 的文件做存储采样决策 */
+#endif
+#ifndef SAMPLE_SIZE
+#define SAMPLE_SIZE (256u * 1024)
+#endif
+#ifndef STORE_RATIO
+#define STORE_RATIO 0.90                        /* 采样压缩率劣于此 → 存储模式 */
+#endif
+
+/* 已压缩数据 (zip/exe/图片) 跳过建模: 直接写 LX0 存储容器 */
+static int write_stored(const char *inpath, const char *outpath,
+                        U64 inN, U32 crc, char *msg, size_t msgn)
+{
+    FILE *fi = fopen(inpath, "rb");
+    if (!fi) { snprintf(msg, msgn, "无法打开文件: %s", inpath); return 1; }
+    FILE *fo = fopen(outpath, "wb");
+    if (!fo) { fclose(fi); snprintf(msg, msgn, "无法写出文件: %s", outpath); return 1; }
+    U8 hdr[15];
+    memcpy(hdr, "LX0", 3);
+    for (int k = 0; k < 8; k++) hdr[3 + k] = (U8)(inN >> (8 * k));
+    for (int k = 0; k < 4; k++) hdr[11 + k] = (U8)(crc >> (8 * k));
+    fwrite(hdr, 1, 15, fo);
+    U8 buf[1 << 16];
+    U64 left = inN;
+    while (left > 0)
+    {
+        size_t chunk = (size_t)((left > (U64)sizeof(buf)) ? sizeof(buf) : (size_t)left);
+        size_t got = fread(buf, 1, chunk, fi);
+        if (got == 0) break;
+        fwrite(buf, 1, got, fo);
+        left -= got;
+    }
+    int werr = ferror(fo);
+    fclose(fo); fclose(fi);
+    if (left != 0 || werr) { remove(outpath); snprintf(msg, msgn, "读写失败"); return 1; }
+    return 0;
+}
+
+/* 采样决策: 只压缩前 256KB 采样片段, 压缩率劣于阈值 → 判定为已压缩数据 */
+LXAPI int lx_compress_file(const char *inpath, const char *outpath,
+                     char *msg, size_t msgn);
+static int looks_incompressible(const char *inpath, U64 inN)
+{
+    U64 sampleN = inN < SAMPLE_SIZE ? inN : SAMPLE_SIZE;
+    char sOut[1030], cOut[1030], smsg[256];
+    snprintf(sOut, sizeof(sOut), "%s.lxs.tmp", inpath);
+    snprintf(cOut, sizeof(cOut), "%s.lxc.tmp", inpath);
+
+    FILE *sf = fopen(inpath, "rb");
+    if (!sf) return 0;
+    FILE *df = fopen(sOut, "wb");
+    if (!df) { fclose(sf); return 0; }
+    U8 buf[1 << 16];
+    U64 left = sampleN;
+    while (left > 0)
+    {
+        size_t chunk = (size_t)((left > (U64)sizeof(buf)) ? sizeof(buf) : (size_t)left);
+        size_t got = fread(buf, 1, chunk, sf);
+        if (got == 0) break;
+        fwrite(buf, 1, got, df);
+        left -= got;
+    }
+    fclose(sf); fclose(df);
+    if (left != 0) { remove(sOut); return 0; }
+
+    int rc = lx_compress_file(sOut, cOut, smsg, sizeof(smsg));
+    int verdict = 0;
+    if (rc == 0)
+    {
+        FILE *cf = fopen(cOut, "rb");
+        if (cf)
+        {
+            _fseeki64(cf, 0, SEEK_END);
+            long long csz = _ftelli64(cf);
+            fclose(cf);
+            if ((double)csz / (double)sampleN > (double)STORE_RATIO) verdict = 1;
+        }
+    }
+    remove(sOut); remove(cOut);
+    return verdict;
+}
+
 LXAPI int lx_compress_file(const char *inpath, const char *outpath,
                      char *msg, size_t msgn) {
-    lx_shutdown();      /* 每个作业从出厂状态开始: 编解码状态必须严格一致 */
-    ensure_init();
-    if (!g_eng_init) { snprintf(msg, msgn, "内存不足: 模型初始化失败"); return 1; }
+    lx_shutdown();      /* 出厂状态 (采样决策内部自管引擎生命周期) */
     clock_t t0 = clock();
 
     FILE *fi = fopen(inpath, "rb");
@@ -559,6 +640,36 @@ LXAPI int lx_compress_file(const char *inpath, const char *outpath,
     _fseeki64(fi, 0, SEEK_SET);
     if (fsz < 0) { fclose(fi); snprintf(msg, msgn, "无法获取文件大小"); return 1; }
     U64 inN = (U64)fsz;
+
+    /* 大文件采样决策: 已压缩数据 (zip/exe/图片) 走存储, 秒级完成 */
+    if (inN > STORE_THRESHOLD && looks_incompressible(inpath, inN))
+    {
+        fclose(fi);
+        U32 crc0 = 0xFFFFFFFFu;
+        fi = fopen(inpath, "rb");
+        if (!fi) { snprintf(msg, msgn, "无法打开文件: %s", inpath); return 1; }
+        U8 buf[1 << 16];
+        U64 left = inN;
+        while (left > 0)
+        {
+            size_t chunk = (size_t)((left > (U64)sizeof(buf)) ? sizeof(buf) : (size_t)left);
+            size_t got = fread(buf, 1, chunk, fi);
+            if (got == 0) break;
+            crc0 = crc32_update(crc0, buf, got);
+            left -= got;
+        }
+        crc0 = CRC32_FINAL(crc0);
+        fclose(fi);
+        int rc = write_stored(inpath, outpath, inN, crc0, msg, msgn);
+        if (rc == 0)
+            snprintf(msg, msgn, "压缩完成 (已压缩数据, 存储模式): %lld 字节",
+                     (long long)inN);
+        return rc;
+    }
+
+    /* 采样决策的内部压缩会训练引擎, 此处强制恢复出厂状态供正式压缩 */
+    lx_shutdown(); ensure_init();
+    if (!g_eng_init) { snprintf(msg, msgn, "内存不足: 模型初始化失败"); return 1; }
 
     /* 历史窗口: 小文件精确容量, 大文件封顶 1GB (循环缓冲) */
     HCAP = (inN + 65536u > (U64)HISTWIN) ? (size_t)HISTWIN : (size_t)(inN + 65536u);
@@ -646,7 +757,7 @@ LXAPI int lx_decompress_file(const char *inpath, const char *outpath,
     FILE *fi = fopen(inpath, "rb");
     if (!fi) { snprintf(msg, msgn, "无法打开文件: %s", inpath); return 1; }
     U8 hdr[15];
-    if (fread(hdr, 1, 15, fi) < 15 || memcmp(hdr, "LX1", 3) != 0) {
+    if (fread(hdr, 1, 15, fi) < 15 || (memcmp(hdr, "LX1", 3) != 0 && memcmp(hdr, "LX0", 3) != 0)) {
         fclose(fi);
         snprintf(msg, msgn, "不是灵犀文件(头错误): %s", inpath);
         return 1;
@@ -655,6 +766,37 @@ LXAPI int lx_decompress_file(const char *inpath, const char *outpath,
     for (int k = 0; k < 8; k++) sz64 |= (U64)hdr[3 + k] << (8 * k);
     U32 want = 0;
     for (int k = 0; k < 4; k++) want |= (U32)hdr[11 + k] << (8 * k);
+    if (memcmp(hdr, "LX0", 3) == 0)
+    {
+        /* 存储容器: 流式拷贝 + CRC 校验 */
+        FILE *fo = fopen(outpath, "wb");
+        if (!fo) { fclose(fi); snprintf(msg, msgn, "无法写出文件: %s", outpath); return 1; }
+        U32 crc = 0xFFFFFFFFu;
+        U8 buf[1 << 16];
+        U64 left = sz64;
+        while (left > 0)
+        {
+            size_t chunk = (size_t)((left > (U64)sizeof(buf)) ? sizeof(buf) : (size_t)left);
+            size_t got = fread(buf, 1, chunk, fi);
+            if (got == 0) break;
+            crc = crc32_update(crc, buf, got);
+            fwrite(buf, 1, got, fo);
+            left -= got;
+        }
+        crc = CRC32_FINAL(crc);
+        int werr = ferror(fo);
+        fclose(fo); fclose(fi);
+        free(H); H = NULL; HCAP = 0;
+        if (left != 0 || crc != want) {
+            remove(outpath);
+            snprintf(msg, msgn, "校验失败! 数据损坏");
+            return 1;
+        }
+        if (werr) { snprintf(msg, msgn, "写出失败: 磁盘空间不足?"); return 1; }
+        snprintf(msg, msgn, "解压完成 (存储模式): %llu 字节, CRC 校验通过",
+                 (unsigned long long)sz64);
+        return 0;
+    }
 
     HCAP = (sz64 + 65536u > (U64)HISTWIN) ? (size_t)HISTWIN : (size_t)(sz64 + 65536u);
     size_t need = HCAP;

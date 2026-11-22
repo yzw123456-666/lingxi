@@ -262,6 +262,22 @@ async function runJob(decompress) {
       rc = E.lx_c_end();
       if (rc < 0) throw new Error(errText(rc));
     }
+    /* LX0 存储容器: 原始字节在头 15 字节之后, 直接 CRC 校验 + 切片 (无需引擎) */
+    if (out[0] === 0x4C && out[1] === 0x58 && out[2] === 0x30) {
+      const dv2 = new DataView(out.buffer, out.byteOffset, out.byteLength);
+      const origSize = Number(dv2.getBigUint64(3, true));
+      let crc = 0xFFFFFFFF;
+      for (let i = 0; i < origSize; i++) crc = CRC_T[(crc ^ out[15 + i]) & 0xFF] ^ (crc >>> 8);
+      crc = (crc ^ 0xFFFFFFFF) >>> 0;
+      const want = dv2.getUint32(11, true);
+      if (crc !== want) throw new Error('CRC 校验失败: 数据已损坏');
+      const payload = out.slice(15, 15 + origSize);
+      lastBlob = new Blob([payload]);
+      lastName = file.name.replace(/\.lx$/i, '');
+      saveResult();
+      showMsg(`解压完成 (存储模式): ${fmt(origSize)}　已保存: ${lastName}　已保存到: ${lastName}`, true);
+      return { blob: lastBlob, bytes: payload };
+    }
     const outLen = E.lx_out_len();
     const out = freshU8().slice(E.lx_out_ptr(), E.lx_out_ptr() + outLen);
     const pct = outLen * 100 / n;
