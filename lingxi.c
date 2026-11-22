@@ -83,7 +83,7 @@ typedef unsigned long long U64;
 #include "tables_gen.h"         /* 固化概率表: 跨编译器/跨目标逐位一致 */
 static void init_tables(void) { }
 #define SQ(s) squash_t[(s) + 2048]
-#define SQ(s) squash_t[(s) + 2048]
+
 
 static U32 fold(U32 h, U32 c) { return (h + c + 1u) * PHI; }
 
@@ -188,6 +188,7 @@ static void putbyte(U8 b) {
         ocap = ocap ? ocap * 2 : (1u << 20);
         U8 *nb = (U8 *)realloc(obuf, ocap);
         if (!nb) { g_oom = 1; return; }           /* 内存不足: 标记并丢弃, 不闪退 */
+        obuf = nb;                                /* 关键: 采用新指针 (WASM arena realloc 非原地) */
     }
     obuf[olen++] = b;
 }
@@ -863,6 +864,7 @@ static U8  *out_g; static unsigned int out_len_g;
 __attribute__((export_name("lx_ver")))
 int lx_ver(void) { return 202; }
 
+
 /* JS 先分配输入缓冲并写入文件字节, 再调 c/d_start。
    input_end = 输入块结束: 解压重置保留输入(其后的上一作业内存全部回收);
    压缩不经输入缓冲(直写 H), 完整归零重置 */
@@ -876,9 +878,9 @@ unsigned char *lx_in_alloc(unsigned int n) {
 
 __attribute__((export_name("lx_c_start")))
 int lx_c_start(unsigned int n) {
-    arena_off = 0; g_eng_init = 0;          /* 完整出厂重置 */
     ensure_init();
-    H = (U8 *)calloc((size_t)n + 65536u, 1u);
+    HCAP = (n + 65536u > (U64)HISTWIN) ? (size_t)HISTWIN : (size_t)(n + 65536u);
+    H = (U8 *)calloc(HCAP, 1);
     if (!H) return -1;
     g_n_total = n;
     reset_state(); ctx_hashes(); rc_init_enc();
@@ -918,8 +920,7 @@ int lx_c_end(void) {
 /* 输入 = 完整 .lx 字节 (JS 已写入 in 缓冲并传指针) */
 __attribute__((export_name("lx_d_start")))
 int lx_d_start(unsigned char *in, unsigned int inN) {
-    arena_off = input_end; g_eng_init = 0;  /* 重置时保留输入缓冲 */
-    ensure_init();
+    ensure_init();                          /* 新实例即出厂; 不重置 arena, 保留输入 */
     if (inN < 15 || memcmp(in, "LX1", 3) != 0) return -1;
     U64 sz64 = 0;
     for (int k = 0; k < 8; k++) sz64 |= (U64)in[3 + k] << (8 * k);
@@ -931,6 +932,7 @@ int lx_d_start(unsigned char *in, unsigned int inN) {
     H = (U8 *)calloc(N + 65536u, 1u);
     if (!d_out || !H) return -2;
     reset_state(); ctx_hashes();
+    HCAP = (N + 65536u > (U64)HISTWIN) ? (size_t)HISTWIN : (size_t)(N + 65536u);
     ibuf = in + 15; ipos = 0; isize = inN - 15;
     rc_init_dec();
     d_total = (unsigned int)N; d_pos = 0; d_want = want;

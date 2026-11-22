@@ -120,13 +120,23 @@ tbtn.onclick = () => {
   applyTheme(theme);
 };
 
+let WASM_BYTES = null;
+let WASM_MODULE = null;
 async function boot() {
-  const raw = Uint8Array.from(atob(WASM_B64), c => c.charCodeAt(0));
-  const inst = await WebAssembly.instantiate(raw, {});
-  E = inst.instance.exports; mem = E.memory;
+  WASM_BYTES = Uint8Array.from(atob(WASM_B64), c => c.charCodeAt(0));
+  WASM_MODULE = new WebAssembly.Module(WASM_BYTES);
+  const inst = new WebAssembly.Instance(WASM_MODULE);
+  E = inst.exports; mem = E.memory;
   $('ver').textContent = '引擎 v' + E.lx_ver();
   $('mode').textContent = '未选择文件';
   $('st').textContent = '空闲 (引擎就绪)';
+}
+/* 每操作新建实例: 全新内存, 从出厂状态开始, 彻底消除状态共享问题 */
+async function newInstance() {
+  while (!WASM_MODULE) await new Promise(r => setTimeout(r, 20));
+  const inst = new WebAssembly.Instance(WASM_MODULE);
+  E = inst.exports; mem = E.memory;
+  return E;
 }
 boot().catch(e => { $('st').textContent = '引擎加载失败: ' + e; });
 
@@ -241,7 +251,9 @@ async function runJob(decompress) {
   const n = file.size;
   setBusy(true, 0);
   try {
+    await newInstance();
     let rc, total;
+    let out = null, outLen = 0, pct = 0;
     if (decompress) {
       const inPtr = E.lx_in_alloc(n);
       freshU8().set(new Uint8Array(await file.arrayBuffer()), inPtr);
@@ -268,6 +280,9 @@ async function runJob(decompress) {
       rc = E.lx_c_end();
       if (rc < 0) throw new Error(errText(rc));
     }
+    outLen = E.lx_out_len();
+    out = freshU8().slice(E.lx_out_ptr(), E.lx_out_ptr() + outLen);
+    pct = outLen * 100 / n;
     /* LX0 存储容器: 原始字节在头 15 字节之后, 直接 CRC 校验 + 切片 (无需引擎) */
     if (out[0] === 0x4C && out[1] === 0x58 && out[2] === 0x30) {
       const dv2 = new DataView(out.buffer, out.byteOffset, out.byteLength);
@@ -284,9 +299,6 @@ async function runJob(decompress) {
       showMsg(`解压完成 (存储模式): ${fmt(origSize)}　已保存: ${lastName}　已保存到: ${lastName}`, true);
       return { blob: lastBlob, bytes: payload };
     }
-    const outLen = E.lx_out_len();
-    const out = freshU8().slice(E.lx_out_ptr(), E.lx_out_ptr() + outLen);
-    const pct = outLen * 100 / n;
     if (decompress && out[0] === 0x4C && out[1] === 0x58 && out[2] === 0x46 && out[3] === 0x31) {
       const zipBytes = lxfToZip(out);
       if (!zipBytes) throw new Error('文件夹归档解析失败');
