@@ -134,7 +134,7 @@ bad = os.path.abspath('app_t6_bad.bin')
 open(bad, 'wb').write(b'this is not a lingxi file' * 10)
 try:
     j = api('/api/decompress', {'path': bad})
-    check('T6b 非灵犀文件报错', j.get('ok') == False and 'LX1' in j.get('msg', ''), j.get('msg', ''))
+    check('T6b 非灵犀文件报错', j.get('ok') == False and '无法识别' in j.get('msg', ''), j.get('msg', ''))
 except urllib.error.HTTPError as e:
     j = json.loads(e.read().decode('utf-8'))
     check('T6b 非灵犀文件报错', e.code == 400 and 'LX1' in j.get('msg', ''), j.get('msg', ''))
