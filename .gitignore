@@ -25,3 +25,5 @@ edit_*.py
 inspect_*.py
 analyze_folder.py
 folder_test*
+app_test*
+folder_test*

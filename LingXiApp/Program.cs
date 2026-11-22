@@ -395,102 +395,100 @@ public class MainForm : Form
         }
     }
 
-    private async void RunPathJob(string op, string path)
+    // ---------- 共享作业实现 (UI postMessage 与 HTTP 端点走同一条路径, 可自动化测试) ----------
+    static (int rc, string msg, string saved, bool isFolder) CompressJob(string srcPath, string destDir)
     {
+        busy = true; progressPct = 0;
+        var sb = new byte[1024];
+        string tmpLxf = null;
         try
         {
-            if (busy) { PostJson(new { type = "done", ok = false, msg = "已有任务进行中" }); return; }
-            if (!File.Exists(path)) { PostJson(new { type = "done", ok = false, msg = "文件不存在: " + path }); return; }
-            bool decompress = op == "decompress";
-            if (decompress)
+            bool isFolder = Directory.Exists(srcPath) && !File.Exists(srcPath);
+            string baseName = Path.GetFileName(srcPath.TrimEnd(Path.DirectorySeparatorChar));
+            string outLx = UniqueOut(Path.Combine(
+                destDir ?? Path.GetDirectoryName(srcPath)!, baseName) + ".lx");
+            int rc;
+            if (isFolder)
             {
-                var head = new byte[15];
-                using (var fs = File.OpenRead(path))
-                    if (await fs.ReadAsync(head) < 15 || Encoding.ASCII.GetString(head, 0, 3) != "LX1")
-                    {
-                        PostJson(new { type = "done", ok = false, msg = "不是灵犀文件: 缺少 LX1 头" });
-                        return;
-                    }
+                tmpLxf = Path.Combine(Path.GetTempPath(), "lxapp_dir_" + Guid.NewGuid().ToString("N") + ".lxf");
+                PackFolder(srcPath, tmpLxf);
+                rc = lx_compress_file(tmpLxf, outLx, sb, sb.Length);
+                if (rc != 0) return (rc, MsgOf(sb), "", false);
+                var nFiles = new DirectoryInfo(srcPath)
+                    .EnumerateFiles("*", SearchOption.AllDirectories).Count();
+                return (0, $"文件夹压缩完成 ({nFiles} 个文件)　已保存到: {outLx}", outLx, false);
             }
-            string candidate = decompress
-                ? Path.Combine(Path.GetDirectoryName(path)!, Path.GetFileNameWithoutExtension(path))
-                : path + ".lx";
-            string tout = Path.Combine(Path.GetTempPath(), "lxapp_out_" + Guid.NewGuid().ToString("N") + ".tmp");
-            busy = true; progressPct = 0;
-            var sb = new byte[1024];
-            int rc = 0;
-            try
-            {
-                rc = await Task.Run(() => decompress
-                    ? lx_decompress_file(path, tout, sb, sb.Length)
-                    : lx_compress_file(path, tout, sb, sb.Length));
-            }
-            finally
-            {
-                busy = false; progressPct = 100;
-                lx_shutdown();
-            }
-            var msg = MsgOf(sb);
-            if (rc != 0)
-            {
-                File.Delete(tout);
-                PostJson(new { type = "done", ok = false, msg = msg });
-                return;
-            }
-            if (decompress && IsFolderArchive(tout))
-            {
-                string dest = UniqueDir(candidate);
-                var (files, dirs) = ExtractFolder(tout, dest);
-                File.Delete(tout);
-                PostJson(new { type = "done", ok = true,
-                    msg = $"解压完成: {files} 个文件 / {dirs} 个文件夹　已保存到: {dest}", saved = dest });
-                return;
-            }
-            string final = UniqueOut(candidate);
-            File.Move(tout, final, true);
-            PostJson(new { type = "done", ok = true, msg = msg + "　已保存到: " + final, saved = final });
+            rc = lx_compress_file(srcPath, outLx, sb, sb.Length);
+            if (rc != 0) return (rc, MsgOf(sb), "", false);
+            return (0, MsgOf(sb) + "　已保存到: " + outLx, outLx, false);
         }
         catch (Exception ex)
         {
-            busy = false;
-            PostJson(new { type = "done", ok = false, msg = "失败: " + ex.Message });
+            return (1, "失败: " + ex.Message, "", false);
+        }
+        finally
+        {
+            if (tmpLxf != null) TryDelete(tmpLxf);
+            lx_shutdown(); busy = false; progressPct = 100;
+        }
+    }
+
+    static (int rc, string msg, string saved, bool isFolder) DecompressJob(string lxPath, string destDir)
+    {
+        busy = true; progressPct = 0;
+        var sb = new byte[1024];
+        string tout = Path.Combine(Path.GetTempPath(), "lxapp_out_" + Guid.NewGuid().ToString("N") + ".tmp");
+        try
+        {
+            var head = new byte[15];
+            using (var fs = File.OpenRead(lxPath))
+                if (fs.Read(head) < 15 || Encoding.ASCII.GetString(head, 0, 3) != "LX1")
+                    return (1, "不是灵犀文件: 缺少 LX1 头", "", false);
+            int rc = lx_decompress_file(lxPath, tout, sb, sb.Length);
+            var msg = MsgOf(sb);
+            if (rc != 0) { TryDelete(tout); return (rc, msg, "", false); }
+            var stem = Path.GetFileNameWithoutExtension(lxPath);
+            if (IsFolderArchive(tout))
+            {
+                string dest = UniqueDir(Path.Combine(destDir ?? Path.GetDirectoryName(lxPath)!, stem));
+                var (files, dirs) = ExtractFolder(tout, dest);
+                TryDelete(tout);
+                return (0, $"解压完成: {files} 个文件 / {dirs} 个文件夹　已保存到: {dest}", dest, true);
+            }
+            string final = UniqueOut(Path.Combine(destDir ?? Path.GetDirectoryName(lxPath)!, stem));
+            File.Move(tout, final, true);
+            return (0, msg + "　已保存到: " + final, final, false);
+        }
+        catch (Exception ex)
+        {
+            TryDelete(tout);
+            return (1, "失败: " + ex.Message, "", false);
+        }
+        finally
+        {
+            lx_shutdown(); busy = false; progressPct = 100;
         }
     }
 
     private async void RunDirJob(string path)
     {
-        try
-        {
-            if (busy) { PostJson(new { type = "done", ok = false, msg = "已有任务进行中" }); return; }
-            if (!Directory.Exists(path)) { PostJson(new { type = "done", ok = false, msg = "文件夹不存在" }); return; }
-            string name = Path.GetFileName(path.TrimEnd(Path.DirectorySeparatorChar));
-            string outLx = UniqueOut(Path.Combine(Path.GetDirectoryName(path)!, name) + ".lx");
-            string tmpLxf = Path.Combine(Path.GetTempPath(), "lxapp_dir_" + Guid.NewGuid().ToString("N") + ".lxf");
-            busy = true; progressPct = 0;
-            var sb = new byte[1024];
-            int rc = 0;
-            try
-            {
-                rc = await Task.Run(() =>
-                {
-                    PackFolder(path, tmpLxf);
-                    return lx_compress_file(tmpLxf, outLx, sb, sb.Length);
-                });
-            }
-            finally
-            {
-                busy = false; progressPct = 100;
-                lx_shutdown();
-                try { File.Delete(tmpLxf); } catch { }
-            }
-            var msg = MsgOf(sb);
-            PostJson(new { type = "done", ok = rc == 0, msg, saved = rc == 0 ? outLx : "" });
-        }
-        catch (Exception ex)
-        {
-            busy = false;
-            PostJson(new { type = "done", ok = false, msg = "失败: " + ex.Message });
-        }
+        if (busy) { PostJson(new { type = "done", ok = false, msg = "已有任务进行中" }); return; }
+        if (!Directory.Exists(path)) { PostJson(new { type = "done", ok = false, msg = "文件夹不存在" }); return; }
+        var r = await Task.Run(() => CompressJob(path, null));
+        PostJson(new { type = "done", ok = r.rc == 0, msg = r.msg, saved = r.saved });
+    }
+
+    private async void RunPathJob(string op, string path)
+    {
+        if (busy) { PostJson(new { type = "done", ok = false, msg = "已有任务进行中" }); return; }
+        if (op != "compress" && op != "decompress")
+        { PostJson(new { type = "done", ok = false, msg = "未知操作" }); return; }
+        if (!File.Exists(path) && !Directory.Exists(path))
+        { PostJson(new { type = "done", ok = false, msg = "路径不存在: " + path }); return; }
+        var r = await Task.Run(() => op == "decompress"
+            ? DecompressJob(path, null)
+            : CompressJob(path, null));
+        PostJson(new { type = "done", ok = r.rc == 0, msg = r.msg, saved = r.saved, isFolder = r.isFolder });
     }
 
     private async void PreviewPathJob(string path)
@@ -597,6 +595,14 @@ public class MainForm : Form
             $"HTTP/1.1 {code} Error\r\nContent-Type: application/json\r\nContent-Length: {body.Length}\r\nConnection: close\r\n\r\n");
         await s.WriteAsync(head);
         await s.WriteAsync(body);
+    }
+
+    static string DownloadsDir()
+    {
+        var d = Path.Combine(Environment.GetFolderPath(
+            Environment.SpecialFolder.UserProfile), "Downloads");
+        Directory.CreateDirectory(d);
+        return d;
     }
 
     static void TryDelete(string path)
@@ -730,105 +736,76 @@ public class MainForm : Form
             BeginInvoke(() => { reallyExit = true; tray.Visible = false; Close(); Application.Exit(); });
             return;
         }
-        if (method == "POST" && path == "/api/packdir")
+        if (method == "POST" && path == "/api/compress")
         {
             if (busy) { await RespondErrAsync(s, 409, "已有任务进行中"); return; }
-            var dirPath = JsonBodyProp(bodyFile, "path");
-            if (dirPath == null || !Directory.Exists(dirPath)) { await RespondErrAsync(s, 400, "文件夹不存在"); return; }
-            string tmpLxf = Path.Combine(Path.GetTempPath(), "lxapp_pack_" + Guid.NewGuid().ToString("N") + ".lxf");
-            try
-            {
-                busy = true; progressPct = 0;
-                PackFolder(dirPath, tmpLxf);
-                busy = false;
-                await RespondFileAsync(s, "application/octet-stream", "Connection: close\r\n", tmpLxf);
-            }
-            finally { busy = false; File.Delete(tmpLxf); }
+            var p1 = JsonBodyProp(bodyFile, "path");
+            if (p1 == null || (!File.Exists(p1) && !Directory.Exists(p1)))
+            { await RespondErrAsync(s, 400, "路径不存在"); return; }
+            var r = await Task.Run(() => CompressJob(p1, null));
+            await RespondAsync(s, "application/json; charset=utf-8", "Connection: close\r\n",
+                Encoding.UTF8.GetBytes(JsonSerializer.Serialize(new { ok = r.rc == 0, msg = r.msg, saved = r.saved })));
             return;
         }
-        if (method == "POST" && path == "/api/extractdir")
+        if (method == "POST" && path == "/api/decompress")
         {
             if (busy) { await RespondErrAsync(s, 409, "已有任务进行中"); return; }
-            var lxfPath = JsonBodyProp(bodyFile, "path");
-            if (lxfPath == null || !File.Exists(lxfPath)) { await RespondErrAsync(s, 400, "归档文件不存在"); return; }
-            busy = true; progressPct = 0;
-            try
-            {
-                string dest = UniqueDir(lxfPath[..^3] is var stem && stem.Length > 0 ? stem : lxfPath + "_out");
-                var (files, dirs) = await Task.Run(() => ExtractFolder(lxfPath, dest));
-                await RespondAsync(s, "application/json; charset=utf-8", "Connection: close\r\n",
-                    Encoding.UTF8.GetBytes($"{{\"ok\":1,\"files\":{files},\"dirs\":{dirs},\"dest\":\"{JsonEsc(dest)}\"}}"));
-            }
-            catch (Exception ex) { await RespondErrAsync(s, 500, ex.Message); }
-            finally { busy = false; }
+            var p1 = JsonBodyProp(bodyFile, "path");
+            if (p1 == null || !File.Exists(p1)) { await RespondErrAsync(s, 400, "文件不存在"); return; }
+            var r = await Task.Run(() => DecompressJob(p1, null));
+            await RespondAsync(s, "application/json; charset=utf-8", "Connection: close\r\n",
+                Encoding.UTF8.GetBytes(JsonSerializer.Serialize(new { ok = r.rc == 0, msg = r.msg,
+                    saved = r.saved, isFolder = r.isFolder })));
             return;
         }
-        if (method == "POST" && (path == "/api/compress" || path == "/api/decompress" || path == "/api/preview"))
+        if (method == "POST" && path == "/api/compress-body")
         {
             if (busy) { await RespondErrAsync(s, 409, "已有任务进行中"); return; }
             if (!File.Exists(bodyFile)) { await RespondErrAsync(s, 400, "缺少请求体"); return; }
-
-            bool decompress = path != "/api/compress";
-            bool preview = path == "/api/preview";
-            string tout = Path.Combine(Path.GetTempPath(), "lxapp_out_" + Guid.NewGuid().ToString("N") + ".tmp");
-
-            if (preview || decompress)
-            {
-                // 提前校验 LX1 头 (直接读用户文件, 无中转副本)
-                var head = new byte[15];
-                await using (var fs = File.OpenRead(bodyFile))
-                    if (await fs.ReadAsync(head) < 15 || Encoding.ASCII.GetString(head, 0, 3) != "LX1")
-                    {
-                        await RespondErrAsync(s, 400, "不是灵犀文件: 缺少 LX1 头");
-                        return;
-                    }
-            }
-
+            var r = await Task.Run(() => CompressJob(bodyFile, DownloadsDir()));
+            await RespondAsync(s, "application/json; charset=utf-8", "Connection: close\r\n",
+                Encoding.UTF8.GetBytes(JsonSerializer.Serialize(new { ok = r.rc == 0, msg = r.msg, saved = r.saved })));
+            return;
+        }
+        if (method == "POST" && path == "/api/decompress-body")
+        {
+            if (busy) { await RespondErrAsync(s, 409, "已有任务进行中"); return; }
+            if (!File.Exists(bodyFile)) { await RespondErrAsync(s, 400, "缺少请求体"); return; }
+            var r = await Task.Run(() => DecompressJob(bodyFile, DownloadsDir()));
+            await RespondAsync(s, "application/json; charset=utf-8", "Connection: close\r\n",
+                Encoding.UTF8.GetBytes(JsonSerializer.Serialize(new { ok = r.rc == 0, msg = r.msg,
+                    saved = r.saved, isFolder = r.isFolder })));
+            return;
+        }
+        if (method == "POST" && path == "/api/preview")
+        {
+            if (busy) { await RespondErrAsync(s, 409, "已有任务进行中"); return; }
+            if (!File.Exists(bodyFile)) { await RespondErrAsync(s, 400, "缺少请求体"); return; }
+            string tout = Path.Combine(Path.GetTempPath(), "lxapp_pv_" + Guid.NewGuid().ToString("N") + ".tmp");
             busy = true; progressPct = 0;
             var msgBuf = new byte[1024];
             int rc = 0;
             try
             {
-                await Task.Run(() =>
-                {
-                    rc = preview || decompress
-                        ? lx_decompress_file(bodyFile, tout, msgBuf, msgBuf.Length)
-                        : lx_compress_file(bodyFile, tout, msgBuf, msgBuf.Length);
-                });
+                await Task.Run(() => { rc = lx_decompress_file(bodyFile, tout, msgBuf, msgBuf.Length); });
             }
             finally
             {
                 busy = false; progressPct = 100;
-                lx_shutdown();              // 任务后释放大表, 空闲回到低占用
+                lx_shutdown();
             }
             var msg = MsgOf(msgBuf);
-
-            if (preview)
+            if (rc != 0)
             {
-                var (origSize, kind, label, content) = BuildPreview(tout, msg);
-                var json = JsonSerializer.Serialize(new { ok = true, origSize, kind, label, msg, content });
                 TryDelete(tout);
-                await RespondAsync(s, "application/json; charset=utf-8", "Connection: close\r\n", Encoding.UTF8.GetBytes(json));
-                return;
-            }
-            if (decompress && IsFolderArchive(tout))
-            {
-                string stem = Path.GetFileNameWithoutExtension(
-                    string.IsNullOrEmpty(nameParam) ? "archive" : nameParam);
-                string dest = UniqueDir(Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads", stem));
-                var (files, dirs) = await Task.Run(() => ExtractFolder(tout, dest));
-                File.Delete(tout);
                 await RespondAsync(s, "application/json; charset=utf-8", "Connection: close\r\n",
-                    Encoding.UTF8.GetBytes(JsonSerializer.Serialize(new { ok = true, extracted = true,
-                        msg = $"文件夹已解压: {files} 个文件 / {dirs} 个目录", dest })));
+                    Encoding.UTF8.GetBytes(JsonSerializer.Serialize(new { ok = false, msg })));
                 return;
             }
-            var em = JsonEsc(msg);
-            var pm = Uri.EscapeDataString(msg);
-            await RespondFileAsync(s, "application/octet-stream",
-                $"X-Lx-Ok: 1\r\nX-Lx-Msg-Enc: {pm}\r\nConnection: close\r\n", tout);
-            File.Delete(tout);
+            var (origSize, kind, label, content) = BuildPreview(tout, msg);
+            TryDelete(tout);
+            await RespondAsync(s, "application/json; charset=utf-8", "Connection: close\r\n",
+                Encoding.UTF8.GetBytes(JsonSerializer.Serialize(new { ok = true, origSize, kind, label, msg, content })));
             return;
         }
         await RespondErrAsync(s, 404, "no route");

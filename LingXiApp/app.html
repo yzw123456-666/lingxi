@@ -251,20 +251,12 @@ $('go').onclick = async () => {
     let bytes;
     try { bytes = new Uint8Array(await sel.file.arrayBuffer()); }
     catch (e) { showMsg(friendly(e), false); setBusy(false, 0); return; }
-    const r = await fetch('/api/' + (decompress ? 'decompress' : 'compress') + '?name='
+    const r = await fetch((decompress ? '/api/decompress-body' : '/api/compress-body') + '?name='
       + encodeURIComponent(sel.name), { method: 'POST', body: bytes });
     if (r.status === 409) { showMsg('已有任务进行中，请稍候', false); setBusy(false, 0); return; }
-    if (!r.ok) { const j = await r.json().catch(() => ({ msg: '请求失败' })); showMsg(j.msg || '请求失败', false); setBusy(false, 0); return; }
-    if ((r.headers.get('Content-Type') || '').includes('json')) {
-      const j = await r.json();
-      showMsg(j.msg + '　文件夹: ' + j.dest, true);
-      setBusy(false, 0); return;
-    }
-    lastOut = await r.blob();
-    lastName = decompress ? sel.name.replace(/\.lx$/i, '') : sel.name + '.lx';
-    const msg = decodeURIComponent(r.headers.get('X-Lx-Msg-Enc') || '');
-    saveResult();
-    showMsg(msg + '　已下载: ' + lastName + '（拖拽模式结果在浏览器默认下载位置）', true);
+    const j = await r.json().catch(() => ({ ok: 0, msg: '请求失败' }));
+    if (!j.ok) { showMsg(j.msg || '请求失败', false); setBusy(false, 0); return; }
+    showMsg(j.msg + '　已保存到: ' + j.saved, true);
   } catch (e) { showMsg(friendly(e), false); }
   setBusy(false, 0);
 };
