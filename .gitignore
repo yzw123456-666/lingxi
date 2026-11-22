@@ -21,3 +21,7 @@ LingXiApp/bin/
 LingXiApp/obj/
 LingXiApp/app.ico.bak
 folder_test/
+edit_*.py
+inspect_*.py
+analyze_folder.py
+folder_test*
