@@ -15,3 +15,8 @@ lx_debug.txt
 *.pdb
 t_utf8*
 LingXiBox_dbg*
+push_gh.py
+LingXiApp/publish/
+LingXiApp/bin/
+LingXiApp/obj/
+LingXiApp/app.ico.bak

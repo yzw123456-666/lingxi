@@ -41,6 +41,12 @@ static size_t arena_off = 0;
 #define stderr ((void *)0)
 #endif
 
+#ifdef _WIN32
+#define LXAPI __attribute__((dllexport))
+#else
+#define LXAPI
+#endif
+
 typedef unsigned char  U8;
 typedef unsigned short U16;
 typedef unsigned int   U32;
@@ -491,7 +497,7 @@ static void ensure_init(void) {
     init_tables(); init_rate(); crc_init(); alloc_all();
     g_eng_init = 1;
 }
-void lx_shutdown(void) {           /* 释放全部大表, 进程回到 ~1MB 常驻 */
+LXAPI void lx_shutdown(void) {           /* 释放全部大表, 进程回到 ~1MB 常驻 */
     if (!g_eng_init) return;
     for (int m = 0; m < 14; m++) { free(T[m].c); T[m].c = NULL; }
     free(MT); free(indT); MT = NULL; indT = NULL;
@@ -502,9 +508,14 @@ void lx_shutdown(void) {           /* 释放全部大表, 进程回到 ~1MB 常�
 }
 void (*lx_progress_cb)(int percent) = NULL;   /* 0..100, 可为 NULL */
 
+/* 供宿主程序注册进度回调 (比导出变量更稳妥) */
+#ifdef LX_DLL
+LXAPI void lx_set_progress(void (*cb)(int)) { lx_progress_cb = cb; }
+#endif
+
 /* ---------- 文件到文件 API: 成功返回 0, 失败返回 1, msg 带中文详情 ---------- */
 #ifndef LX_WASM
-int lx_compress_file(const char *inpath, const char *outpath,
+LXAPI int lx_compress_file(const char *inpath, const char *outpath,
                      char *msg, size_t msgn) {
     lx_shutdown();      /* 每个作业从出厂状态开始: 编解码状态必须严格一致 */
     ensure_init();
@@ -554,7 +565,7 @@ int lx_compress_file(const char *inpath, const char *outpath,
     return 0;
 }
 
-int lx_decompress_file(const char *inpath, const char *outpath,
+LXAPI int lx_decompress_file(const char *inpath, const char *outpath,
                        char *msg, size_t msgn) {
     lx_shutdown();      /* 每个作业从出厂状态开始(与编码端一致) */
     ensure_init();
@@ -709,6 +720,11 @@ unsigned char *lx_out_ptr(void) { return out_g; }
 __attribute__((export_name("lx_out_len")))
 unsigned int lx_out_len(void) { return out_len_g; }
 #endif /* LX_WASM */
+
+#ifdef LX_DLL
+#define LX_NO_MAIN
+#define LX_WASM_GUARD_UNUSED
+#endif
 
 #ifndef LX_NO_MAIN
 int main(int argc, char **argv) {
